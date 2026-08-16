@@ -17,54 +17,82 @@ Railway Generate Domain (*.up.railway.app)
    VLESS + XHTTP + TLS
    (TLS terminates at Railway)
 
-Railway TCP Proxy #1
+TCP Proxy → application port 8081
         │
         ▼
-   127.0.0.1:8081
    VLESS + RAW/TCP + REALITY + Vision
 
-Railway TCP Proxy #2
+TCP Proxy → application port 8082
         │
         ▼
-   127.0.0.1:8082
    VLESS + XHTTP + REALITY
 
-Railway TCP Proxy #3
+TCP Proxy → application port 8083
         │
         ▼
-   127.0.0.1:8083
    VLESS + gRPC + REALITY
 ```
 
-### Important
+### Physical isolation
 
-A single Railway TCP Proxy cannot physically deliver three incompatible REALITY transports to three different Xray listeners. Therefore this version intentionally uses **three TCP Proxy endpoints**, each mapped to a dedicated internal port.
+A single Railway TCP Proxy cannot physically deliver three incompatible REALITY transports to three different Xray listeners. This version intentionally uses three TCP Proxy endpoints, each mapped to a dedicated internal port.
 
 ## Railway Networking
 
 Create:
 
 1. Generate Domain → target/application port `8080`
-2. TCP Proxy #1 → target/application port `8081`
-3. TCP Proxy #2 → target/application port `8082`
-4. TCP Proxy #3 → target/application port `8083`
+2. TCP Proxy → target/application port `8081`
+3. TCP Proxy → target/application port `8082`
+4. TCP Proxy → target/application port `8083`
 
-Set these runtime variables using the actual current Railway TCP Proxy endpoints:
+Railway generates the public domain and external proxy port for each TCP Proxy. The project can now discover all three endpoints dynamically from Railway's Public GraphQL API by matching `applicationPort`.
+
+## Dynamic TCP proxy discovery
+
+Set a Railway **Project Token** as a sealed service variable:
 
 ```text
-VISION_PUBLIC_HOST
-VISION_PUBLIC_PORT
-
-XHTTP_REALITY_PUBLIC_HOST
-XHTTP_REALITY_PUBLIC_PORT
-
-GRPC_REALITY_PUBLIC_HOST
-GRPC_REALITY_PUBLIC_PORT
+RAILWAY_PROJECT_TOKEN=<your Railway project token>
 ```
 
-Do not reuse an old TCP Proxy endpoint.
+The container already receives these Railway system variables:
 
-The HTTP domain can be supplied automatically through `RAILWAY_PUBLIC_DOMAIN`; `PUBLIC_DOMAIN` may also be set explicitly.
+```text
+RAILWAY_SERVICE_ID
+RAILWAY_ENVIRONMENT_ID
+RAILWAY_TCP_PROXY_DOMAIN
+RAILWAY_TCP_PROXY_PORT
+RAILWAY_TCP_APPLICATION_PORT
+```
+
+At startup, when `RAILWAY_PROJECT_TOKEN` (or `RAILWAY_API_TOKEN`) is present, `scripts/discover_tcp_proxies.py` queries:
+
+```text
+https://backboard.railway.com/graphql/v2
+```
+
+using Railway's documented `tcpProxies(serviceId, environmentId)` query and selects proxies by their target application port:
+
+```text
+8081 → Vision
+8082 → XHTTP REALITY
+8083 → gRPC REALITY
+```
+
+The discovered public host/port values are written only to a runtime temporary environment file and are **never persisted as subscription state**. This means a Railway-generated hostname or external port can change without requiring a code change or restoration of an old endpoint.
+
+For project tokens, the API uses Railway's `Project-Access-Token` header. Account/workspace tokens may instead be supplied as `RAILWAY_API_TOKEN` and use the Bearer authorization header.
+
+### Fallback mode
+
+If no Railway API token is configured, the project keeps a compatibility fallback:
+
+- Vision uses `VISION_PUBLIC_*` or Railway's automatic `RAILWAY_TCP_PROXY_*` variables.
+- XHTTP REALITY uses `XHTTP_REALITY_PUBLIC_*`.
+- gRPC REALITY uses `GRPC_REALITY_PUBLIC_*`.
+
+For fully automatic endpoint tracking, configure `RAILWAY_PROJECT_TOKEN`.
 
 ## Four nodes
 

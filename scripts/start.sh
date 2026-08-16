@@ -47,15 +47,29 @@ fi
 
 PUBLIC_DOMAIN="${PUBLIC_DOMAIN:-${RAILWAY_PUBLIC_DOMAIN:-}}"
 
-# Railway exposes the currently configured TCP Proxy through these system
-# variables. Use them as the authoritative Vision endpoint unless an
-# explicit VISION_PUBLIC_* override is supplied.
+# Public TCP endpoints are runtime state, not persistent state. When a
+# Railway API token is configured, discover all three proxies by their
+# application ports (8081/8082/8083). This survives Railway changing the
+# generated domains or external ports.
+DISCOVERY_ENV="$D/tcp-proxy.env"
+rm -f "$DISCOVERY_ENV"
+
+if [ -n "${RAILWAY_PROJECT_TOKEN:-}" ] || [ -n "${RAILWAY_API_TOKEN:-}" ]; then
+  if python3 /opt/xray/scripts/discover_tcp_proxies.py > "$DISCOVERY_ENV"; then
+    # The discovery script validates hostnames/ports before emitting values.
+    . "$DISCOVERY_ENV"
+    echo "TCP_DISCOVERY=railway-api" 
+  else
+    rm -f "$DISCOVERY_ENV"
+    echo "TCP_DISCOVERY=railway-api-failed; using explicit/runtime fallback" >&2
+  fi
+fi
+
+# Fallbacks: 8081 is supplied automatically by Railway's generic TCP proxy
+# variables. 8082/8083 can still be explicitly supplied if API discovery is
+# not enabled or temporarily unavailable.
 VISION_HOST="${VISION_PUBLIC_HOST:-${RAILWAY_TCP_PROXY_DOMAIN:-}}"
 VISION_PORT="${VISION_PUBLIC_PORT:-${RAILWAY_TCP_PROXY_PORT:-}}"
-
-# Railway currently exposes only one TCP Proxy endpoint through the generic
-# system variables. The additional physical-isolation proxies must be passed
-# explicitly for ports 8082 and 8083.
 XREAL_HOST="${XHTTP_REALITY_PUBLIC_HOST:-}"
 XREAL_PORT="${XHTTP_REALITY_PUBLIC_PORT:-}"
 GRPC_HOST="${GRPC_REALITY_PUBLIC_HOST:-}"
@@ -63,8 +77,8 @@ GRPC_PORT="${GRPC_REALITY_PUBLIC_PORT:-}"
 
 [ -n "$PUBLIC_DOMAIN" ] || { echo "missing PUBLIC_DOMAIN/RAILWAY_PUBLIC_DOMAIN" >&2; exit 1; }
 [ -n "$VISION_HOST" ] && [ -n "$VISION_PORT" ] || { echo "missing Vision TCP proxy: VISION_PUBLIC_HOST/PORT or RAILWAY_TCP_PROXY_DOMAIN/PORT" >&2; exit 1; }
-[ -n "$XREAL_HOST" ] && [ -n "$XREAL_PORT" ] || { echo "missing XHTTP_REALITY_PUBLIC_HOST/PORT" >&2; exit 1; }
-[ -n "$GRPC_HOST" ] && [ -n "$GRPC_PORT" ] || { echo "missing GRPC_REALITY_PUBLIC_HOST/PORT" >&2; exit 1; }
+[ -n "$XREAL_HOST" ] && [ -n "$XREAL_PORT" ] || { echo "missing XHTTP_REALITY_PUBLIC_HOST/PORT; set RAILWAY_PROJECT_TOKEN or XHTTP_REALITY_PUBLIC_*" >&2; exit 1; }
+[ -n "$GRPC_HOST" ] && [ -n "$GRPC_PORT" ] || { echo "missing GRPC_REALITY_PUBLIC_HOST/PORT; set RAILWAY_PROJECT_TOKEN or GRPC_REALITY_PUBLIC_*" >&2; exit 1; }
 
 # The old endpoint is permanently rejected.
 for pair in "$VISION_HOST:$VISION_PORT" "$XREAL_HOST:$XREAL_PORT" "$GRPC_HOST:$GRPC_PORT"; do

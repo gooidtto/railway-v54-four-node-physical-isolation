@@ -2,7 +2,7 @@
 set -eu
 umask 077
 
-BUILD_ID="fixed-8-node-three-tcp-v1"
+BUILD_ID="fixed-8-node-three-tcp-stable-reality-v2"
 D="${RAILWAY_VOLUME_MOUNT_PATH:-${DATA_DIR:-/data}}"
 C="${XRAY_CONFIG:-/etc/xray/config.json}"
 READY_FILE="${GATEWAY_READY_FILE:-$D/gateway.ready}"
@@ -109,9 +109,9 @@ echo "TCP_PROXY_1=${TCP_HOST}:${TCP_PORT} -> ${TCP_APP}"
 echo "TCP_PROXY_2=${TCP2_HOST}:${TCP2_PORT} -> ${TCP2_APP}"
 echo "TCP_PROXY_3=${TCP3_HOST}:${TCP3_PORT} -> ${TCP3_APP}"
 echo "GATEWAY_LISTEN=8080,8081,8082,8083"
-echo "REALITY_SNI_COUNT=7 DISTRIBUTION=3,2,2"
+echo "REALITY_SNI=www.cloudflare.com SHORT_IDS=7 DISTRIBUTION=3,2,2"
 echo "SUBSCRIPTION=https://${PUBLIC_DOMAIN}/sub/${TOKEN}"
-echo "NODES=8 (1 HTTPS XHTTP + 7 REALITY Vision; TCP 3,2,2)"
+echo "NODES=8 (1 HTTPS XHTTP + 7 REALITY Vision; TCP 3,2,2; unique short IDs)"
 echo "READY: build=$BUILD_ID gateway=8080,8081,8082,8083 xray_reality=10087 xray_xhttp=10086"
 
 while kill -0 "$XP" 2>/dev/null && kill -0 "$GP" 2>/dev/null; do sleep 5; done

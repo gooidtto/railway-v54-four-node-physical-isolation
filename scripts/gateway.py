@@ -22,14 +22,22 @@ HTTP_PREFIXES = (
 )
 
 
-def subscription(token):
-    try:
-        if token != TOKEN.read_text().strip():
-            return None
-        raw = SUB.read_bytes()
-        return base64.b64encode(raw) if raw.strip() else None
-    except OSError:
-        return None
+def load_subscription(token, method):
+    expected = TOKEN.read_text().strip()
+    if token != expected:
+        print(f"[gateway] SUB_TOKEN_INVALID expected_len={len(expected)} got_len={len(token)}", flush=True)
+        return None, "TOKEN_INVALID"
+    raw = SUB.read_bytes()
+    if not raw.strip():
+        print("[gateway] SUB_FILE_EMPTY", flush=True)
+        return None, "SUB_FILE_EMPTY"
+    lines = [line.strip() for line in raw.decode("utf-8", "strict").splitlines() if line.strip()]
+    if len(lines) != 8 or any(not line.startswith("vless://") for line in lines):
+        print(f"[gateway] SUB_INVALID_LINES={len(lines)}", flush=True)
+        return None, "SUB_INVALID"
+    payload = base64.b64encode(raw)
+    print(f"[gateway] SUB_REQUEST method={method} nodes={len(lines)} bytes={len(raw)} response=200", flush=True)
+    return payload, "OK"
 
 
 def is_tls_client_hello(data):
@@ -64,11 +72,7 @@ async def relay_to(reader, writer, initial, dest, label):
         local_port = writer.get_extra_info("sockname")[1]
         peer = writer.get_extra_info("peername")
         print(f"[gateway] ROUTE={label} port={local_port} peer={peer} target={dest[0]}:{dest[1]}", flush=True)
-
-        tasks = {
-            asyncio.create_task(pipe(reader, upstream)),
-            asyncio.create_task(pipe(up_r, writer)),
-        }
+        tasks = {asyncio.create_task(pipe(reader, upstream)), asyncio.create_task(pipe(up_r, writer))}
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for task in done:
             try:
@@ -108,46 +112,47 @@ async def relay_to(reader, writer, initial, dest, label):
 
 async def handle_http(reader, writer, initial):
     line = initial.split(b"\r\n", 1)[0].decode("latin1", "ignore")
-    m = re.match(r"^(?:GET|HEAD) /sub/([A-Za-z0-9_-]{20,128})(?:\?[^ ]*)? HTTP/", line)
+    m = re.match(r"^(GET|HEAD) /sub/([A-Za-z0-9_-]{20,128}) HTTP/", line)
     if m:
-        payload = subscription(m.group(1))
-        if payload is None:
-            body = b"not found\n"
-            resp = (
-                b"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n"
-                b"Content-Length: " + str(len(body)).encode() +
-                b"\r\nConnection: close\r\n\r\n" + body
-            )
-        elif line.startswith("HEAD"):
-            resp = (
-                b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
-                b"Content-Length: " + str(len(payload)).encode() +
-                b"\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
-            )
+        method, token = m.group(1), m.group(2)
+        try:
+            payload, status = load_subscription(token, method)
+        except (OSError, UnicodeError) as exc:
+            print(f"[gateway] SUB_READ_ERROR={type(exc).__name__}:{exc}", flush=True)
+            payload, status = None, "SUB_READ_ERROR"
+        if payload is not None:
+            if method == "HEAD":
+                response = (
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n"
+                    b"Content-Length: " + str(len(payload)).encode() +
+                    b"\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
+                )
+            else:
+                response = (
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n"
+                    b"Content-Length: " + str(len(payload)).encode() +
+                    b"\r\nCache-Control: no-store\r\nContent-Disposition: inline\r\nConnection: close\r\n\r\n" + payload
+                )
         else:
-            resp = (
-                b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n"
-                b"Content-Length: " + str(len(payload)).encode() +
-                b"\r\nCache-Control: no-store\r\nContent-Disposition: inline\r\n"
-                b"Connection: close\r\n\r\n" + payload
+            body = (status + "\n").encode()
+            code = b"404 Not Found" if status in {"TOKEN_INVALID", "SUB_FILE_MISSING"} else b"500 Internal Server Error"
+            response = (
+                b"HTTP/1.1 " + code + b"\r\nContent-Type: text/plain\r\n"
+                b"Content-Length: " + str(len(body)).encode() +
+                b"\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n" + body
             )
-        writer.write(resp)
+        writer.write(response)
         await writer.drain()
         return
 
     if line.startswith(("GET /ready", "HEAD /ready")):
         if gateway_ready():
             body = b"ready\n"
-            writer.write(
-                b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
-                b"Content-Length: 6\r\nConnection: close\r\n\r\n" + body
-            )
+            response = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 6\r\nConnection: close\r\n\r\n" + body
         else:
             body = b"starting\n"
-            writer.write(
-                b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\n"
-                b"Content-Length: 9\r\nRetry-After: 2\r\nConnection: close\r\n\r\n" + body
-            )
+            response = b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 9\r\nRetry-After: 2\r\nConnection: close\r\n\r\n" + body
+        writer.write(response)
         await writer.drain()
         return
 
@@ -155,8 +160,7 @@ async def handle_http(reader, writer, initial):
         body = SITE.read_bytes()
         writer.write(
             b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n"
-            b"Content-Length: " + str(len(body)).encode() +
-            b"\r\nConnection: close\r\n\r\n" + body
+            b"Content-Length: " + str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" + body
         )
         await writer.drain()
         return
@@ -171,15 +175,12 @@ async def handle(reader, writer):
             initial = await asyncio.wait_for(reader.read(65536), TIMEOUT)
             if not initial:
                 return
-
             if is_tls_client_hello(initial):
                 await relay_to(reader, writer, initial, REALITY_DEST, "tls-reality")
                 return
-
             if initial.startswith(HTTP_PREFIXES):
                 await handle_http(reader, writer, initial)
                 return
-
             print(f"[gateway] REJECT peer={peer} unknown protocol", flush=True)
         except asyncio.CancelledError:
             raise
@@ -198,10 +199,7 @@ async def main():
         READY_FILE.unlink()
     except FileNotFoundError:
         pass
-
-    servers = []
-    for port in PORTS:
-        servers.append(await asyncio.start_server(handle, "0.0.0.0", port, limit=65536))
+    servers = [await asyncio.start_server(handle, "0.0.0.0", port, limit=65536) for port in PORTS]
     print(f"GATEWAY_READY=ports={','.join(map(str, PORTS))} HTTP->10086 TLS->10087", flush=True)
     try:
         await asyncio.gather(*(serve.serve_forever() for serve in servers))
@@ -214,7 +212,6 @@ async def main():
             serve.close()
             await serve.wait_closed()
         await asyncio.gather(*(serve.wait_closed() for serve in servers), return_exceptions=True)
-
 
 if __name__ == "__main__":
     asyncio.run(main())

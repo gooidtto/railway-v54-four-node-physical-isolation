@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 umask 077
-BUILD_ID="fixed-4-node-physical-isolation-v1"
+BUILD_ID="fixed-4-node-physical-isolation-v2"
 D="${RAILWAY_VOLUME_MOUNT_PATH:-${DATA_DIR:-/data}}"; C="${XRAY_CONFIG:-/etc/xray/config.json}"; READY_FILE="${GATEWAY_READY_FILE:-$D/gateway.ready}"
 mkdir -p "$D" "$(dirname "$C")"; rm -f "$READY_FILE"
 write_secret(){ f="$1"; v="$2"; t="$f.tmp"; printf '%s\n' "$v">"$t"; chmod 600 "$t"; mv -f "$t" "$f"; }
@@ -14,8 +14,6 @@ TCP_HOST="${RAILWAY_TCP_PROXY_DOMAIN:-reseau.proxy.rlwy.net}";TCP_PORT="${RAILWA
 TCP2_HOST="${RAILWAY_TCP_PROXY_2_DOMAIN:-interchange.proxy.rlwy.net}";TCP2_PORT="${RAILWAY_TCP_PROXY_2_PORT:-23389}";TCP2_APP="${RAILWAY_TCP_PROXY_2_APPLICATION_PORT:-8082}"
 TCP3_HOST="${RAILWAY_TCP_PROXY_3_DOMAIN:-altaria.proxy.rlwy.net}";TCP3_PORT="${RAILWAY_TCP_PROXY_3_PORT:-17903}";TCP3_APP="${RAILWAY_TCP_PROXY_3_APPLICATION_PORT:-8083}"
 [ "$TCP_APP:$TCP2_APP:$TCP3_APP" = "8081:8082:8083" ] || { echo "ERROR: TCP targets must be 8081:8082:8083" >&2; exit 1; }
-# WS+TLS terminates inside Xray on 10089. Railway TCP Proxy is L4, so no TLS certificate is provided by Railway.
-# Use a persisted self-signed certificate for the current TCP proxy hostname; the generated URI therefore sets allowInsecure=1.
 WS_CERT="$D/ws_tls_cert.pem"; WS_KEY="$D/ws_tls_key.pem"; WS_HOST="${WS_HOST:-$TCP3_HOST}"
 if [ ! -s "$WS_CERT" ] || [ ! -s "$WS_KEY" ] || ! grep -q "CN = $WS_HOST" "$D/ws_tls_cert_meta" 2>/dev/null; then
   openssl req -x509 -newkey rsa:2048 -nodes -days 825 -keyout "$WS_KEY" -out "$WS_CERT" -subj "/CN=$WS_HOST" -addext "subjectAltName=DNS:$WS_HOST" >/dev/null 2>&1
@@ -27,7 +25,17 @@ export RAILWAY_TCP_PROXY_2_DOMAIN="$TCP2_HOST" RAILWAY_TCP_PROXY_2_PORT="$TCP2_P
 export RAILWAY_TCP_PROXY_3_DOMAIN="$TCP3_HOST" RAILWAY_TCP_PROXY_3_PORT="$TCP3_PORT" RAILWAY_TCP_PROXY_3_APPLICATION_PORT="$TCP3_APP"
 export XRAY_HTTP_PORT=10086 XRAY_REALITY_PORT=10087 GATEWAY_PORTS="8080,8081,8082,8083" GATEWAY_READY_FILE="$READY_FILE"
 export REALITY_SNI_CANDIDATES_FILE="${REALITY_SNI_CANDIDATES_FILE:-/opt/xray/config/reality-sni-candidates.txt}" WS_CERT WS_KEY WS_HOST
+# Remove stale generated artifacts from the former 8-node build before regenerating.
+rm -f "$D/subscription.txt" "$D/subscription.txt.tmp" "$D/manifest.json" "$D/state.json"
 python3 /opt/xray/scripts/generate.py
+python3 - "$D/subscription.txt" <<'PY'
+import sys
+p=sys.argv[1]
+lines=[x.strip() for x in open(p,encoding='utf-8') if x.strip()]
+if len(lines)!=4:
+    raise SystemExit(f"FATAL: subscription invariant failed: expected 4 nodes, got {len(lines)}")
+print("SUBSCRIPTION_INVARIANT=4", flush=True)
+PY
 xray run -test -config "$C"
 xray run -config "$C" & XP=$!; GP=""; trap 'rm -f "$READY_FILE";kill "$XP" "$GP" 2>/dev/null||true;wait "$XP" 2>/dev/null||true;wait "$GP" 2>/dev/null||true' INT TERM EXIT
 wait_port(){ h="$1";p="$2";label="$3";i=0;while :;do if python3 -c 'import socket,sys;s=socket.create_connection((sys.argv[1],int(sys.argv[2])),1);s.close()' "$h" "$p" 2>/dev/null;then echo "READY_CHECK=$label:$p";return 0;fi;if ! kill -0 "$XP" 2>/dev/null;then echo "ERROR: xray exited before $label:$p" >&2;exit 1;fi;i=$((i+1));[ "$i" -lt "${READY_TIMEOUT:-90}" ]||{ echo "ERROR: readiness timeout $label:$p" >&2;exit 1;};sleep 1;done;}

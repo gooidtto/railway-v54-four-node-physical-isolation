@@ -1,14 +1,19 @@
 {
-  "release": "fixed-8-node-baseline",
-  "architecture": "one-xray-core-one-http-domain-one-tcp-proxy-seven-reality-sni",
-  "gateway_port": 8080,
-  "internal_ports": {
-    "xhttp_tls": 10086,
-    "reality": 10087
+  "release": "fixed-4-node-physical-isolation-v4",
+  "architecture": "one-xray-core-four-physical-entry-paths",
+  "nodes": 4,
+  "entries": {
+    "443": "xhttp-tls",
+    "23337": "raw-reality-vision",
+    "23389": "grpc-reality",
+    "17903": "ws-tls"
   },
-  "nodes": 8,
-  "https_xhttp_nodes": 1,
-  "reality_vision_nodes": 7,
-  "tcp_proxy_target": 8080,
-  "reality_sni_count": 7
+  "gateway_ports": {
+    "8080": 10086,
+    "8081": 10087,
+    "8082": 10088,
+    "8083": 10089
+  },
+  "reality_sni_count": 1,
+  "source_of_truth": "main"
 }

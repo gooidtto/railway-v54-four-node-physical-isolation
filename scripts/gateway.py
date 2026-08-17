@@ -12,6 +12,7 @@ DATA = Path(os.environ.get("DATA_DIR", "/data"))
 SITE = Path("/opt/xray/site/index.html")
 TOKEN = DATA / "subscription_token.txt"
 SUB = DATA / "subscription.txt"
+READY_FILE = Path(os.environ.get("GATEWAY_READY_FILE", str(DATA / "gateway.ready")))
 MAX_CONN = int(os.environ.get("GATEWAY_MAX_CONNECTIONS", "512"))
 TIMEOUT = float(os.environ.get("GATEWAY_READ_TIMEOUT", "15"))
 SEM = asyncio.Semaphore(MAX_CONN)
@@ -33,6 +34,10 @@ def subscription(token):
 
 def is_tls_client_hello(data):
     return len(data) >= 3 and data[0] == 0x16 and data[1] == 0x03 and data[2] in (0x01, 0x02, 0x03, 0x04)
+
+
+def gateway_ready():
+    return READY_FILE.is_file()
 
 
 async def pipe(reader, writer):
@@ -131,11 +136,18 @@ async def handle_http(reader, writer, initial):
         return
 
     if line.startswith(("GET /ready", "HEAD /ready")):
-        body = b"ready\n"
-        writer.write(
-            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
-            b"Content-Length: 6\r\nConnection: close\r\n\r\n" + body
-        )
+        if gateway_ready():
+            body = b"ready\n"
+            writer.write(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+                b"Content-Length: 6\r\nConnection: close\r\n\r\n" + body
+            )
+        else:
+            body = b"starting\n"
+            writer.write(
+                b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\n"
+                b"Content-Length: 9\r\nRetry-After: 2\r\nConnection: close\r\n\r\n" + body
+            )
         await writer.drain()
         return
 
@@ -160,9 +172,6 @@ async def handle(reader, writer):
             if not initial:
                 return
 
-            # Both Railway entry ports terminate at the same protocol-aware
-            # gateway. HTTP is forwarded to XHTTP; TLS ClientHello is forwarded
-            # byte-for-byte to the private REALITY listener.
             if is_tls_client_hello(initial):
                 await relay_to(reader, writer, initial, REALITY_DEST, "tls-reality")
                 return
@@ -185,6 +194,11 @@ async def handle(reader, writer):
 
 
 async def main():
+    try:
+        READY_FILE.unlink()
+    except FileNotFoundError:
+        pass
+
     servers = []
     for port in PORTS:
         servers.append(await asyncio.start_server(handle, "0.0.0.0", port, limit=65536))
@@ -192,6 +206,10 @@ async def main():
     try:
         await asyncio.gather(*(serve.serve_forever() for serve in servers))
     finally:
+        try:
+            READY_FILE.unlink()
+        except FileNotFoundError:
+            pass
         for serve in servers:
             serve.close()
             await serve.wait_closed()

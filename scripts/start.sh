@@ -2,10 +2,12 @@
 set -eu
 umask 077
 
-BUILD_ID="fixed-8-node-unified"
+BUILD_ID="fixed-8-node-unified-readiness-v2"
 D="${RAILWAY_VOLUME_MOUNT_PATH:-${DATA_DIR:-/data}}"
 C="${XRAY_CONFIG:-/etc/xray/config.json}"
+READY_FILE="${GATEWAY_READY_FILE:-$D/gateway.ready}"
 mkdir -p "$D" "$(dirname "$C")"
+rm -f "$READY_FILE"
 
 write_secret() {
   file="$1"; value="$2"; tmp="${file}.tmp"
@@ -64,35 +66,65 @@ export RAILWAY_TCP_PROXY_DOMAIN="$TCP_HOST" RAILWAY_TCP_PROXY_PORT="$TCP_PORT"
 export RAILWAY_TCP_APPLICATION_PORT="$TCP_APP"
 export XRAY_HTTP_PORT=10086 XRAY_REALITY_PORT=10087
 export GATEWAY_PORTS="8080,8081"
+export GATEWAY_READY_FILE="$READY_FILE"
 export REALITY_SNI_CANDIDATES_FILE="${REALITY_SNI_CANDIDATES_FILE:-/opt/xray/config/reality-sni-candidates.txt}"
 
 python3 /opt/xray/scripts/generate.py
 xray run -test -config "$C"
 
-python3 /opt/xray/scripts/gateway.py &
-GP=$!
+# Start Xray first. Railway readiness must not be exposed until both private
+# inbounds and the public gateway are alive and the subscription is generated.
 xray run -config "$C" &
 XP=$!
 
-trap 'kill "$XP" "$GP" 2>/dev/null || true; wait "$XP" 2>/dev/null || true; wait "$GP" 2>/dev/null || true' INT TERM EXIT
+trap 'rm -f "$READY_FILE"; kill "$XP" "$GP" 2>/dev/null || true; wait "$XP" 2>/dev/null || true; wait "$GP" 2>/dev/null || true' INT TERM EXIT
 
-i=0
-while :; do
-  if kill -0 "$XP" 2>/dev/null && \
-     kill -0 "$GP" 2>/dev/null && \
-     python3 -c 'import socket; s=socket.create_connection(("127.0.0.1",8080),1); s.close()' 2>/dev/null && \
-     python3 -c 'import socket; s=socket.create_connection(("127.0.0.1",8081),1); s.close()' 2>/dev/null && \
-     python3 -c 'import socket; s=socket.create_connection(("127.0.0.1",10086),1); s.close()' 2>/dev/null && \
-     python3 -c 'import socket; s=socket.create_connection(("127.0.0.1",10087),1); s.close()' 2>/dev/null; then
-    break
-  fi
-  i=$((i+1))
-  [ "$i" -lt "${READY_TIMEOUT:-90}" ] || { echo "runtime readiness timeout" >&2; exit 1; }
-  sleep 1
-done
+wait_port() {
+  host="$1"
+  port="$2"
+  label="$3"
+  i=0
+  while :; do
+    if python3 -c 'import socket,sys; s=socket.create_connection((sys.argv[1],int(sys.argv[2])),1); s.close()' "$host" "$port" 2>/dev/null; then
+      echo "READY_CHECK=$label:$port"
+      return 0
+    fi
+    if ! kill -0 "$XP" 2>/dev/null; then
+      echo "xray exited before $label:$port became ready" >&2
+      exit 1
+    fi
+    i=$((i+1))
+    [ "$i" -lt "${READY_TIMEOUT:-90}" ] || { echo "readiness timeout waiting for $label:$port" >&2; exit 1; }
+    sleep 1
+  done
+}
+
+wait_port 127.0.0.1 10086 xray-xhttp
+wait_port 127.0.0.1 10087 xray-reality
+
+python3 /opt/xray/scripts/gateway.py &
+GP=$!
+
+wait_port 127.0.0.1 8080 gateway
+wait_port 127.0.0.1 8081 gateway
 
 printf '%s/sub/%s\n' "https://${PUBLIC_DOMAIN}" "$TOKEN" > "$D/subscription_url.txt"
 chmod 600 "$D/subscription_url.txt"
+
+# Only this marker turns /ready from 503 into 200.
+printf 'ready\n' > "$READY_FILE"
+chmod 600 "$READY_FILE"
+
+# Verify the actual HTTP readiness contract before announcing READY.
+i=0
+while :; do
+  if python3 -c 'import urllib.request; r=urllib.request.urlopen("http://127.0.0.1:8080/ready", timeout=2); raise SystemExit(0 if r.status == 200 and r.read() == b"ready\\n" else 1)' 2>/dev/null; then
+    break
+  fi
+  i=$((i+1))
+  [ "$i" -lt "${READY_TIMEOUT:-90}" ] || { echo "gateway /ready verification failed" >&2; exit 1; }
+  sleep 1
+done
 
 echo "BUILD=$BUILD_ID"
 echo "TOPOLOGY=GenerateDomain:443->gateway:8080->xhttp:10086; TCP:${TCP_HOST}:${TCP_PORT}->gateway:${TCP_APP}->reality:10087"
@@ -103,6 +135,7 @@ echo "SUBSCRIPTION=https://${PUBLIC_DOMAIN}/sub/${TOKEN}"
 echo "NODES=8 (1 HTTPS XHTTP + 7 REALITY Vision SNI)"
 echo "READY: build=$BUILD_ID gateway=8080,8081 xray_reality=10087 xray_xhttp=10086 tcp_proxy=${TCP_HOST}:${TCP_PORT} target=${TCP_APP}"
 
+after_ready_wait=0
 while kill -0 "$XP" 2>/dev/null && kill -0 "$GP" 2>/dev/null; do
   sleep 5
 done

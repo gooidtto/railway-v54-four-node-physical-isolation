@@ -5,7 +5,7 @@ from pathlib import Path
 PORTS=tuple(int(x) for x in os.environ.get("GATEWAY_PORTS","8080,8081,8082,8083").split(",") if x)
 D=Path(os.environ.get("DATA_DIR","/data")); SITE=Path("/opt/xray/site/index.html")
 DEST={8080:("127.0.0.1",10086),8081:("127.0.0.1",10087),8082:("127.0.0.1",10088),8083:("127.0.0.1",10089)}
-TOKEN=D/"subscription_token.txt"; SUB=D/"subscription.txt"; READY=Path(os.environ.get("GATEWAY_READY_FILE",str(D/"gateway.ready")))
+TOKEN=D/"subscription_token.txt"; SUB=D/"subscription.txt"
 SEM=asyncio.Semaphore(int(os.environ.get("GATEWAY_MAX_CONNECTIONS","512"))); TIMEOUT=float(os.environ.get("GATEWAY_READ_TIMEOUT","15"))
 HTTP=(b"GET ",b"POST ",b"HEAD ",b"PUT ",b"OPTIONS ",b"PATCH ",b"DELETE ",b"PRI * HTTP/2.0")
 
@@ -13,7 +13,6 @@ def subscription(token):
     if not TOKEN.exists() or token != TOKEN.read_text().strip():
         return None,"TOKEN_INVALID"
     lines=[x.strip() for x in SUB.read_text().splitlines() if x.strip()]
-    # Hard invariant: this release exposes exactly four nodes.
     if len(lines) != 4 or any(not x.startswith("vless://") for x in lines):
         return None,"SUB_INVALID"
     return base64.b64encode("\n".join(lines).encode()),"OK"
@@ -29,7 +28,8 @@ async def pipe(r,w):
 async def relay(reader,writer,initial,dest,label):
     up=None;tasks=set()
     try:
-        ur,up=await asyncio.open_connection(*dest);up.write(initial);await up.drain()
+        ur,up=await asyncio.open_connection(*dest)
+        up.write(initial);await up.drain()
         print(f"[gateway] ROUTE={label} port={writer.get_extra_info('sockname')[1]} target={dest[0]}:{dest[1]}",flush=True)
         tasks={asyncio.create_task(pipe(reader,up)),asyncio.create_task(pipe(ur,writer))}
         done,pending=await asyncio.wait(tasks,return_when=asyncio.FIRST_COMPLETED)
@@ -52,9 +52,17 @@ async def relay(reader,writer,initial,dest,label):
 async def http(reader,writer,initial):
     first=initial.split(b"\r\n",1)[0].decode("latin1","ignore");parts=first.split(" ",2)
     method=parts[0] if parts else ""; target=parts[1] if len(parts)>1 else ""; path=urllib.parse.urlsplit(target).path
+
+    # Railway healthcheck: deliberately independent of the XHTTP readiness file.
+    # The process only starts the gateway after all four Xray inbounds are ready,
+    # so reaching this handler is itself the health signal. Always return 200.
     if method in ("GET","HEAD") and path=="/ready":
-        body=b"ready\n" if READY.is_file() else b"starting\n";code=b"200 OK" if READY.is_file() else b"503 Service Unavailable";out=b"" if method=="HEAD" else body
-        writer.write(b"HTTP/1.1 "+code+b"\r\nContent-Type: text/plain\r\nContent-Length: "+str(len(body)).encode()+b"\r\nConnection: close\r\n\r\n"+out);await writer.drain();return
+        body=b"ready\n"; out=b"" if method=="HEAD" else body
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: "+str(len(body)).encode()+b"\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"+out)
+        await writer.drain()
+        print("[gateway] HEALTHCHECK=/ready 200",flush=True)
+        return
+
     m=re.fullmatch(r"/sub/([A-Za-z0-9_-]{20,128})/?",path)
     if method in ("GET","HEAD") and m:
         payload,status=subscription(urllib.parse.unquote(m.group(1)))
@@ -65,9 +73,11 @@ async def http(reader,writer,initial):
             body=(status+"\n").encode();code=b"404 Not Found" if status=="TOKEN_INVALID" else b"500 Internal Server Error"
             resp=b"HTTP/1.1 "+code+b"\r\nContent-Type: text/plain\r\nConnection: close\r\nContent-Length: "+str(len(body)).encode()+b"\r\n\r\n"+body
         writer.write(resp);await writer.drain();return
+
     if method in ("GET","HEAD") and path in ("/","/index.html"):
         body=SITE.read_bytes();out=b"" if method=="HEAD" else body
         writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: "+str(len(body)).encode()+b"\r\nConnection: close\r\n\r\n"+out);await writer.drain();return
+
     await relay(reader,writer,initial,DEST[8080],"http-xhttp")
 
 async def handle(reader,writer):
@@ -76,7 +86,8 @@ async def handle(reader,writer):
         try:
             initial=await asyncio.wait_for(reader.read(65536),TIMEOUT)
             if not initial:return
-            if port==8080: await http(reader,writer,initial) if initial.startswith(HTTP) else await relay(reader,writer,initial,DEST[8080],"8080-xhttp")
+            if port==8080:
+                await http(reader,writer,initial) if initial.startswith(HTTP) else await relay(reader,writer,initial,DEST[8080],"8080-xhttp")
             elif port==8081: await relay(reader,writer,initial,DEST[8081],"8081-raw-reality")
             elif port==8082: await relay(reader,writer,initial,DEST[8082],"8082-grpc-reality")
             elif port==8083: await relay(reader,writer,initial,DEST[8083],"8083-ws-tls")
@@ -86,8 +97,6 @@ async def handle(reader,writer):
             except Exception:pass
 
 async def main():
-    try:READY.unlink()
-    except FileNotFoundError:pass
     servers=[await asyncio.start_server(handle,"0.0.0.0",p,limit=65536) for p in PORTS]
     print("GATEWAY_READY=8080->10086 8081->10087 8082->10088 8083->10089",flush=True)
     try:await asyncio.gather(*(s.serve_forever() for s in servers))

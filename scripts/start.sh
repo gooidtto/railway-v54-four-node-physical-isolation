@@ -6,7 +6,7 @@ D="${RAILWAY_VOLUME_MOUNT_PATH:-${DATA_DIR:-/data}}";C="${XRAY_CONFIG:-/etc/xray
 mkdir -p "$D" "$(dirname "$C")"
 write_secret(){ f="$1";v="$2";t="$f.tmp";printf '%s\n' "$v">"$t";chmod 600 "$t";mv -f "$t" "$f"; }
 PUBLIC_DOMAIN="${RAILWAY_PUBLIC_DOMAIN:-}";[ -n "$PUBLIC_DOMAIN" ]||{ echo "FATAL: RAILWAY_PUBLIC_DOMAIN unavailable" >&2;exit 1; }
-# Railway only injects one canonical TCP proxy pair. Additional proxies are explicit service variables.
+# Railway injects one canonical TCP proxy pair. Additional proxies are explicit service variables.
 TCP_HOST="${RAILWAY_TCP_PROXY_DOMAIN:-shuttle.proxy.rlwy.net}";TCP_PORT="${RAILWAY_TCP_PROXY_PORT:-50612}"
 TCP2_HOST="${TCP_PROXY_2_DOMAIN:-${RAILWAY_TCP_PROXY_2_DOMAIN:-interchange.proxy.rlwy.net}}";TCP2_PORT="${TCP_PROXY_2_PORT:-${RAILWAY_TCP_PROXY_2_PORT:-23389}}"
 TCP3_HOST="${TCP_PROXY_3_DOMAIN:-${RAILWAY_TCP_PROXY_3_DOMAIN:-altaria.proxy.rlwy.net}}";TCP3_PORT="${TCP_PROXY_3_PORT:-${RAILWAY_TCP_PROXY_3_PORT:-17903}}"
@@ -14,6 +14,7 @@ UUID_FILE="$D/uuid.txt";PRIV_FILE="$D/reality_private_key.txt";PUB_FILE="$D/real
 if [ -s "$UUID_FILE" ];then UUID=$(tr -d '[:space:]'<"$UUID_FILE");else UUID=$(xray uuid);write_secret "$UUID_FILE" "$UUID";fi
 if [ -s "$PRIV_FILE" ]&&[ -s "$PUB_FILE" ];then PRIVATE_KEY=$(tr -d '[:space:]'<"$PRIV_FILE");PUBLIC_KEY=$(tr -d '[:space:]'<"$PUB_FILE");else OUT="$(xray x25519 2>&1)";PRIVATE_KEY=$(printf '%s\n' "$OUT"|awk -F': ' '/^PrivateKey/{print $2;exit}');PUBLIC_KEY=$(printf '%s\n' "$OUT"|awk -F': ' '/^Password/{print $2;exit}');[ -n "$PRIVATE_KEY" ]&&[ -n "$PUBLIC_KEY" ]||{ echo "FATAL: failed to generate REALITY keys" >&2;exit 1;};write_secret "$PRIV_FILE" "$PRIVATE_KEY";write_secret "$PUB_FILE" "$PUBLIC_KEY";fi
 if [ -s "$TOKEN_FILE" ];then TOKEN=$(tr -d '[:space:]'<"$TOKEN_FILE");else TOKEN=$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))');write_secret "$TOKEN_FILE" "$TOKEN";fi
+# Keep UUID/REALITY keys/short IDs persistent; only generated subscription metadata is rebuilt.
 rm -f "$D/subscription.txt" "$D/subscription.txt.tmp" "$D/manifest.json" "$D/state.json"
 WS_CERT="$D/ws_tls_cert.pem";WS_KEY="$D/ws_tls_key.pem";WS_HOST="${WS_HOST:-$TCP3_HOST}"
 if [ ! -s "$WS_CERT" ]||[ ! -s "$WS_KEY" ]||! grep -q "^$WS_HOST$" "$D/ws_tls_cert_meta" 2>/dev/null;then openssl req -x509 -newkey rsa:2048 -nodes -days 825 -keyout "$WS_KEY" -out "$WS_CERT" -subj "/CN=$WS_HOST" -addext "subjectAltName=DNS:$WS_HOST" >/dev/null 2>&1;printf '%s\n' "$WS_HOST">"$D/ws_tls_cert_meta";chmod 600 "$WS_CERT" "$WS_KEY";fi

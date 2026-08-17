@@ -4,18 +4,28 @@ from pathlib import Path
 D=Path(os.environ.get('DATA_DIR','/data'));D.mkdir(parents=True,exist_ok=True)
 C=Path(os.environ.get('XRAY_CONFIG','/etc/xray/config.json'))
 UUID=os.environ['UUID'].strip();PRIVATE_KEY=os.environ['PRIVATE_KEY'].strip();PUBLIC_KEY=os.environ['PUBLIC_KEY'].strip();PUBLIC_DOMAIN=os.environ['PUBLIC_DOMAIN'].strip()
-APP_PORT=8080;NODE_COUNT=3
-h=(os.environ.get('RAILWAY_TCP_PROXY_DOMAIN') or '').strip();p0=(os.environ.get('RAILWAY_TCP_PROXY_PORT') or '').strip()
-if not h or not p0:raise SystemExit('FATAL: RAILWAY_TCP_PROXY_DOMAIN/PORT required')
-try:p=int(p0)
-except ValueError:raise SystemExit(f'FATAL: invalid RAILWAY_TCP_PROXY_PORT={p0!r}')
-if not 1<=p<=65535:raise SystemExit('FATAL: invalid TCP proxy port')
+APP_PORT=8080
+TCP_HOST=(os.environ.get('RAILWAY_TCP_PROXY_DOMAIN') or '').strip();TCP_PORT_RAW=(os.environ.get('RAILWAY_TCP_PROXY_PORT') or '').strip()
+if not TCP_HOST or not TCP_PORT_RAW:raise SystemExit('FATAL: RAILWAY_TCP_PROXY_DOMAIN/PORT required')
+try:TCP_PORT=int(TCP_PORT_RAW)
+except ValueError:raise SystemExit('FATAL: invalid RAILWAY_TCP_PROXY_PORT')
+if not 1<=TCP_PORT<=65535:raise SystemExit('FATAL: invalid TCP proxy port')
 FP=os.environ.get('REALITY_FINGERPRINT','chrome').strip() or 'chrome'
 RAW_SNI=os.environ.get('REALITY_RAW_SNI','www.cloudflare.com').strip() or 'www.cloudflare.com'
 XHTTP_SNI=os.environ.get('REALITY_XHTTP_SNI','www.apple.com').strip() or 'www.apple.com'
 RAW_TARGET=os.environ.get('REALITY_RAW_TARGET','www.cloudflare.com:443').strip() or 'www.cloudflare.com:443'
 XHTTP_TARGET=os.environ.get('REALITY_XHTTP_TARGET','www.apple.com:443').strip() or 'www.apple.com:443'
 XPATH=os.environ.get('XHTTP_PATH','/xhttp').strip() or '/xhttp'
+CF_TOKEN=os.environ.get('CLOUDFLARE_TUNNEL_TOKEN','').strip();CF_HOST=os.environ.get('CLOUDFLARE_PUBLIC_HOSTNAME','').strip().lower();CF_ORIGIN=os.environ.get('CLOUDFLARE_ORIGIN_SERVICE','').strip();CF_PORT_RAW=os.environ.get('WS_PORT','').strip();CF_PATH=os.environ.get('WS_PATH','').strip();CF_ID=os.environ.get('CLOUDFLARE_TUNNEL_ID','').strip()
+CF_ENABLED=bool(CF_TOKEN and CF_HOST and CF_ORIGIN and CF_PORT_RAW and CF_PATH)
+if CF_ENABLED:
+    try:CF_PORT=int(CF_PORT_RAW)
+    except ValueError:CF_ENABLED=False
+    if CF_ENABLED and not 1<=CF_PORT<=65535:CF_ENABLED=False
+    if CF_ENABLED and not re.fullmatch(r'[A-Za-z0-9.-]+',CF_HOST):CF_ENABLED=False
+    if CF_ENABLED and not CF_PATH.startswith('/'):CF_ENABLED=False
+    if CF_ENABLED and not re.fullmatch(r'http://127\.0\.0\.1:\d+',CF_ORIGIN):CF_ENABLED=False
+if CF_ENABLED and CF_ORIGIN!=f'http://127.0.0.1:{CF_PORT}':raise SystemExit(f'FATAL: CLOUDFLARE_ORIGIN_SERVICE must equal http://127.0.0.1:{CF_PORT}')
 ids_file=D/'reality_short_ids.json'
 try:ids=json.loads(ids_file.read_text()) if ids_file.exists() else []
 except Exception:ids=[]
@@ -31,17 +41,23 @@ def reality(tag,port,network,sni,target,sid,flow=''):
 xhttp_tls={'tag':'vless-xhttp-tls','listen':'127.0.0.1','port':10086,'protocol':'vless','settings':{'clients':[{'id':UUID,'level':0}],'decryption':'none'},'streamSettings':{'network':'xhttp','security':'none','xhttpSettings':{'path':XPATH,'mode':'auto'}}}
 raw=reality('vless-reality-vision',10087,'tcp',RAW_SNI,RAW_TARGET,ids[0],'xtls-rprx-vision')
 xhttp_reality=reality('vless-xhttp-reality',10088,'xhttp',XHTTP_SNI,XHTTP_TARGET,ids[1])
-config={'log':{'loglevel':os.environ.get('XRAY_LOGLEVEL','warning')},'policy':{'levels':{'0':{'handshake':8,'connIdle':900,'uplinkOnly':2,'downlinkOnly':5}}},'inbounds':[xhttp_tls,raw,xhttp_reality],'outbounds':[{'tag':'direct','protocol':'freedom'},{'tag':'block','protocol':'blackhole'}]}
+inbounds=[xhttp_tls,raw,xhttp_reality]
+if CF_ENABLED:
+    inbounds.append({'tag':'vless-ws-cloudflare','listen':'127.0.0.1','port':CF_PORT,'protocol':'vless','settings':{'clients':[{'id':UUID,'level':0}],'decryption':'none'},'streamSettings':{'network':'ws','security':'none','wsSettings':{'path':CF_PATH}}})
+config={'log':{'loglevel':os.environ.get('XRAY_LOGLEVEL','warning')},'policy':{'levels':{'0':{'handshake':8,'connIdle':900,'uplinkOnly':2,'downlinkOnly':5}}},'inbounds':inbounds,'outbounds':[{'tag':'direct','protocol':'freedom'},{'tag':'block','protocol':'blackhole'}]}
 C.write_text(json.dumps(config,indent=2)+'\n')
 def q(d):return urllib.parse.urlencode({k:str(v) for k,v in d.items() if v not in (None,'')},safe='')
 def link(host,port,params,name):return f'vless://{UUID}@{host}:{port}?{q(params)}#{urllib.parse.quote(name,safe="")}'
-lines=[
-link(PUBLIC_DOMAIN,443,{'encryption':'none','security':'tls','sni':PUBLIC_DOMAIN,'fp':FP,'alpn':'h2,http/1.1','type':'xhttp','path':XPATH,'mode':'auto'},'VLESS XHTTP TLS · Railway Domain'),
-link(h,p,{'encryption':'none','flow':'xtls-rprx-vision','security':'reality','sni':RAW_SNI,'fp':FP,'pbk':PUBLIC_KEY,'sid':ids[0],'type':'tcp'},'VLESS RAW REALITY Vision · TCP Proxy'),
-link(h,p,{'encryption':'none','security':'reality','sni':XHTTP_SNI,'fp':FP,'alpn':'h2','pbk':PUBLIC_KEY,'sid':ids[1],'type':'xhttp','path':XPATH,'mode':'auto'},'VLESS XHTTP REALITY · TCP Proxy')]
+lines=[link(PUBLIC_DOMAIN,443,{'encryption':'none','security':'tls','sni':PUBLIC_DOMAIN,'fp':FP,'alpn':'h2,http/1.1','type':'xhttp','path':XPATH,'mode':'auto'},'VLESS XHTTP TLS · Railway Domain'),link(TCP_HOST,TCP_PORT,{'encryption':'none','flow':'xtls-rprx-vision','security':'reality','sni':RAW_SNI,'fp':FP,'pbk':PUBLIC_KEY,'sid':ids[0],'type':'tcp'},'VLESS RAW REALITY Vision · TCP Proxy'),link(TCP_HOST,TCP_PORT,{'encryption':'none','security':'reality','sni':XHTTP_SNI,'fp':FP,'alpn':'h2','pbk':PUBLIC_KEY,'sid':ids[1],'type':'xhttp','path':XPATH,'mode':'auto'},'VLESS XHTTP REALITY · TCP Proxy')]
+if CF_ENABLED:lines.append(link(CF_HOST,443,{'encryption':'none','security':'tls','sni':CF_HOST,'fp':FP,'alpn':'http/1.1','type':'ws','host':CF_HOST,'path':CF_PATH},'VLESS WS TLS · Cloudflare Tunnel'))
+NODE_COUNT=4 if CF_ENABLED else 3
 if len(lines)!=NODE_COUNT:raise SystemExit(f'FATAL: expected {NODE_COUNT} nodes, got {len(lines)}')
-state={'schema':18,'build':'stable-3node-single-8080','architecture':'single-8080-router','node_count':3,'application_port':8080,'public_domain':PUBLIC_DOMAIN,'tcp_proxy':{'domain':h,'port':p,'application_port':8080},'routes':{'domain_xhttp_tls':{'port':10086},'raw_reality_vision':{'sni':RAW_SNI,'port':10087,'short_id':ids[0]},'xhttp_reality':{'sni':XHTTP_SNI,'port':10088,'short_id':ids[1]}},'xhttp_path':XPATH}
+state={'schema':19,'build':'stable-optional-cloudflare-ws','architecture':'single-8080-router-plus-optional-cloudflare-tunnel','node_count':NODE_COUNT,'application_port':8080,'public_domain':PUBLIC_DOMAIN,'tcp_proxy':{'domain':TCP_HOST,'port':TCP_PORT,'application_port':8080},'routes':{'domain_xhttp_tls':{'port':10086},'raw_reality_vision':{'sni':RAW_SNI,'port':10087,'short_id':ids[0]},'xhttp_reality':{'sni':XHTTP_SNI,'port':10088,'short_id':ids[1]}}}
+state['cloudflare']={'enabled':CF_ENABLED}
+if CF_ENABLED:state['cloudflare'].update({'tunnel_id':CF_ID,'public_hostname':CF_HOST,'origin_service':CF_ORIGIN,'ws_port':CF_PORT,'ws_path':CF_PATH})
 state['fingerprint']=hashlib.sha256(json.dumps(state,sort_keys=True,separators=(',',':')).encode()).hexdigest()
 (D/'state.json').write_text(json.dumps(state,indent=2)+'\n');(D/'subscription.txt.tmp').write_text('\n'.join(lines)+'\n');os.replace(D/'subscription.txt.tmp',D/'subscription.txt')
-(D/'manifest.json').write_text(json.dumps({'schema':18,'build':'stable-3node-single-8080','node_count':3,'application_port':8080,'distribution':{'01':'domain-xhttp-tls','02':'raw-reality-vision','03':'xhttp-reality'},'state_fingerprint':state['fingerprint']},indent=2)+'\n')
-print('RELEASE=stable-3node-single-8080',flush=True);print('ARCHITECTURE=single-8080-router',flush=True);print('SUBSCRIPTION_INVARIANT=3',flush=True);print(f'DOMAIN {PUBLIC_DOMAIN}:443 -> 8080 -> 10086 XHTTP TLS',flush=True);print(f'TCP {h}:{p} -> 8080 -> {RAW_SNI} -> 10087 RAW REALITY Vision',flush=True);print(f'TCP {h}:{p} -> 8080 -> {XHTTP_SNI} -> 10088 XHTTP REALITY',flush=True);print('NODES=3',flush=True)
+(D/'manifest.json').write_text(json.dumps({'schema':19,'build':'stable-optional-cloudflare-ws','node_count':NODE_COUNT,'application_port':8080,'cloudflare_ws_enabled':CF_ENABLED,'distribution':{'01':'domain-xhttp-tls','02':'raw-reality-vision','03':'xhttp-reality',**({'04':'cloudflare-ws-tls'} if CF_ENABLED else {})},'state_fingerprint':state['fingerprint']},indent=2)+'\n')
+print('RELEASE=stable-optional-cloudflare-ws',flush=True);print('ARCHITECTURE=single-8080-router-plus-optional-cloudflare-tunnel',flush=True);print(f'CLOUDFLARE_WS={"enabled" if CF_ENABLED else "disabled"}',flush=True);print(f'SUBSCRIPTION_INVARIANT={NODE_COUNT}',flush=True);print(f'DOMAIN {PUBLIC_DOMAIN}:443 -> 8080 -> 10086 XHTTP TLS',flush=True);print(f'TCP {TCP_HOST}:{TCP_PORT} -> 8080 -> {RAW_SNI} -> 10087 RAW REALITY Vision',flush=True);print(f'TCP {TCP_HOST}:{TCP_PORT} -> 8080 -> {XHTTP_SNI} -> 10088 XHTTP REALITY',flush=True)
+if CF_ENABLED:print(f'CF {CF_HOST}:443 -> tunnel -> {CF_ORIGIN} -> {CF_PORT} WS',flush=True)
+print(f'NODES={NODE_COUNT}',flush=True)

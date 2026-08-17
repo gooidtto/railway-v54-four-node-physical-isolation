@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-import asyncio, base64, os, re
+import asyncio
+import base64
+import os
+import re
 from pathlib import Path
 
 LISTEN = ("0.0.0.0", 8080)
-DEST = ("127.0.0.1", int(os.environ.get("XRAY_HTTP_PORT", "10086")))
+HTTP_DEST = ("127.0.0.1", int(os.environ.get("XRAY_HTTP_PORT", "10086")))
+REALITY_DEST = ("127.0.0.1", int(os.environ.get("XRAY_REALITY_PORT", "10087")))
 DATA = Path(os.environ.get("DATA_DIR", "/data"))
 SITE = Path("/opt/xray/site/index.html")
 TOKEN = DATA / "subscription_token.txt"
@@ -16,6 +20,7 @@ HTTP_PREFIXES = (
     b"PATCH ", b"DELETE ", b"PRI * HTTP/2.0"
 )
 
+
 def subscription(token):
     try:
         if token != TOKEN.read_text().strip():
@@ -24,6 +29,11 @@ def subscription(token):
         return base64.b64encode(raw) if raw.strip() else None
     except OSError:
         return None
+
+
+def is_tls_client_hello(data):
+    return len(data) >= 3 and data[0] == 0x16 and data[1] == 0x03 and data[2] in (0x01, 0x02, 0x03, 0x04)
+
 
 async def pipe(reader, writer):
     try:
@@ -36,19 +46,22 @@ async def pipe(reader, writer):
     except (ConnectionError, asyncio.CancelledError):
         return
 
-async def relay(reader, writer, initial):
+
+async def relay_to(reader, writer, initial, dest, label):
     up = None
     try:
-        up_r, up = await asyncio.open_connection(*DEST)
+        up_r, up = await asyncio.open_connection(*dest)
         up.write(initial)
         await up.drain()
+        print(f"[gateway] ROUTE={label} peer={writer.get_extra_info('peername')} target={dest[0]}:{dest[1]}", flush=True)
         await asyncio.gather(pipe(reader, up), pipe(up_r, writer))
     except Exception as e:
-        print(f"relay error: {type(e).__name__}: {e}", flush=True)
+        print(f"[gateway] relay={label} error={type(e).__name__}: {e}", flush=True)
     finally:
         for w in (writer, up):
             if w:
                 w.close()
+
 
 async def handle_http(reader, writer, initial):
     line = initial.split(b"\r\n", 1)[0].decode("latin1", "ignore")
@@ -58,8 +71,7 @@ async def handle_http(reader, writer, initial):
         if payload is None:
             body = b"not found\n"
             resp = (
-                b"HTTP/1.1 404 Not Found\r\n"
-                b"Content-Type: text/plain\r\n"
+                b"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n"
                 b"Content-Length: " + str(len(body)).encode() +
                 b"\r\nConnection: close\r\n\r\n" + body
             )
@@ -99,30 +111,47 @@ async def handle_http(reader, writer, initial):
         await writer.drain()
         return
 
-    await relay(reader, writer, initial)
+    await relay_to(reader, writer, initial, HTTP_DEST, "http-xhttp")
+
 
 async def handle(reader, writer):
     peer = writer.get_extra_info("peername")
     async with SEM:
         try:
-            initial = await asyncio.wait_for(
-                reader.readuntil(b"\r\n\r\n"), TIMEOUT
-            )
-            if not initial.startswith(HTTP_PREFIXES):
-                print(f"gateway rejected peer={peer}", flush=True)
-                writer.close()
+            initial = await asyncio.wait_for(reader.read(65536), TIMEOUT)
+            if not initial:
                 return
-            await handle_http(reader, writer, initial)
-        except Exception as e:
-            print(f"gateway error peer={peer}: {type(e).__name__}: {e}", flush=True)
-        finally:
+
+            # The single Railway TCP Proxy and the Generate Domain both enter
+            # the same gateway. HTTP is sent to XHTTP; TLS ClientHello is sent
+            # byte-for-byte to the REALITY listener. No TLS termination occurs
+            # in the gateway.
+            if is_tls_client_hello(initial):
+                await relay_to(reader, writer, initial, REALITY_DEST, "tls-reality")
+                return
+
+            if initial.startswith(HTTP_PREFIXES):
+                await handle_http(reader, writer, initial)
+                return
+
+            print(f"[gateway] REJECT peer={peer} unknown protocol", flush=True)
             writer.close()
+        except Exception as e:
+            print(f"[gateway] ERROR peer={peer}: {type(e).__name__}: {e}", flush=True)
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
 
 async def main():
     server = await asyncio.start_server(handle, *LISTEN, limit=65536)
-    print("HTTP_GATEWAY_READY=8080 -> 127.0.0.1:10086", flush=True)
+    print("GATEWAY_READY=8080 HTTP->10086 TLS->10087", flush=True)
     async with server:
         await server.serve_forever()
+
 
 if __name__ == "__main__":
     asyncio.run(main())

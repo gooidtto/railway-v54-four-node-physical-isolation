@@ -1,7 +1,1 @@
 www.cloudflare.com
-www.bing.com
-www.canva.com
-www.notion.so
-store.epicgames.com
-www.gog.com
-www.gamespot.com

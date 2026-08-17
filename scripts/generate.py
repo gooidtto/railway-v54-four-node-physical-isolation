@@ -12,15 +12,26 @@ C=Path(os.environ.get("XRAY_CONFIG","/etc/xray/config.json"))
 UUID=os.environ["UUID"].strip(); PRIVATE_KEY=os.environ["PRIVATE_KEY"].strip(); PUBLIC_KEY=os.environ["PUBLIC_KEY"].strip(); PUBLIC_DOMAIN=os.environ["PUBLIC_DOMAIN"].strip()
 NODE_COUNT=4
 
-def required_proxy(prefix,expected_app):
-    h=os.environ.get(prefix+"_DOMAIN","").strip(); p=os.environ.get(prefix+"_PORT","").strip(); a=os.environ.get(prefix+"_APPLICATION_PORT","").strip()
-    if not h or not p or not a: raise SystemExit(f"FATAL: {prefix} runtime variables are required")
+# Railway does not expose TCP Proxy metadata as container environment variables.
+# Keep deterministic fallbacks here as well as in start.sh, so generation is
+# independent of Railway's environment-variable injection behavior.
+DEFAULTS={
+    "RAILWAY_TCP_PROXY": ("reseau.proxy.rlwy.net","23337","8081"),
+    "RAILWAY_TCP_PROXY_2": ("interchange.proxy.rlwy.net","23389","8082"),
+    "RAILWAY_TCP_PROXY_3": ("altaria.proxy.rlwy.net","17903","8083"),
+}
+def proxy(prefix,expected_app):
+    dh,dp,da=DEFAULTS[prefix]
+    h=os.environ.get(prefix+"_DOMAIN",dh).strip() or dh
+    p=os.environ.get(prefix+"_PORT",dp).strip() or dp
+    a=os.environ.get(prefix+"_APPLICATION_PORT",da).strip() or da
     try:p,a=int(p),int(a)
     except ValueError: raise SystemExit(f"FATAL: invalid {prefix} port")
-    if not 1<=p<=65535 or a!=expected_app: raise SystemExit(f"FATAL: {prefix} must target application port {expected_app}")
+    if not h or not 1<=p<=65535 or a!=expected_app:
+        raise SystemExit(f"FATAL: {prefix} must target application port {expected_app}")
     return {"domain":h,"port":p,"application_port":a}
 
-p1=required_proxy("RAILWAY_TCP_PROXY",8081); p2=required_proxy("RAILWAY_TCP_PROXY_2",8082); p3=required_proxy("RAILWAY_TCP_PROXY_3",8083)
+p1=proxy("RAILWAY_TCP_PROXY",8081); p2=proxy("RAILWAY_TCP_PROXY_2",8082); p3=proxy("RAILWAY_TCP_PROXY_3",8083)
 REALITY_TARGET=os.environ.get("REALITY_TARGET","www.cloudflare.com:443").strip()
 SNI_FILE=Path(os.environ.get("REALITY_SNI_CANDIDATES_FILE","/opt/xray/config/reality-sni-candidates.txt"))
 snis=[x.strip() for x in SNI_FILE.read_text().splitlines() if x.strip()]
@@ -52,8 +63,8 @@ if len(lines)!=NODE_COUNT: raise SystemExit(f"FATAL: subscription invariant fail
 for i,line in enumerate(lines,1):
     u=urllib.parse.urlsplit(line)
     if u.scheme!="vless" or not u.hostname or not u.port: raise SystemExit(f"FATAL: node {i}: invalid URI")
-state={"schema":9,"build":"fixed-4-node-physical-isolation-v5","architecture":"physical-four-entry","node_count":4,"public_domain":PUBLIC_DOMAIN,"gateway":{"8080":10086,"8081":10087,"8082":10088,"8083":10089},"tcp_proxies":[p1,p2,p3],"xray_inbounds":{"xhttp_tls":10086,"reality_raw":10087,"reality_grpc":10088,"ws_tls":10089},"reality":{"target":REALITY_TARGET,"sni":REALITY_SNI,"short_ids":ids},"ws":{"host":WS_HOST,"path":WS_PATH},"grpc":{"service_name":GRPC_SERVICE}}
+state={"schema":10,"build":"fixed-4-node-physical-isolation-v6","architecture":"physical-four-entry","node_count":4,"public_domain":PUBLIC_DOMAIN,"gateway":{"8080":10086,"8081":10087,"8082":10088,"8083":10089},"tcp_proxies":[p1,p2,p3],"xray_inbounds":{"xhttp_tls":10086,"reality_raw":10087,"reality_grpc":10088,"ws_tls":10089},"reality":{"target":REALITY_TARGET,"sni":REALITY_SNI,"short_ids":ids},"ws":{"host":WS_HOST,"path":WS_PATH},"grpc":{"service_name":GRPC_SERVICE}}
 fingerprint=hashlib.sha256(json.dumps(state,sort_keys=True,separators=(",",":")).encode()).hexdigest(); state["fingerprint"]=fingerprint
 (D/"state.json").write_text(json.dumps(state,indent=2)+"\n"); (D/"subscription.txt.tmp").write_text("\n".join(lines)+"\n"); os.replace(D/"subscription.txt.tmp",D/"subscription.txt")
-(D/"manifest.json").write_text(json.dumps({"schema":9,"build":"fixed-4-node-physical-isolation-v5","node_count":4,"architecture":"physical-four-entry","distribution":{"443":"xhttp-tls","8081":"raw-reality-vision","8082":"grpc-reality","8083":"ws-tls"},"state_fingerprint":fingerprint},indent=2)+"\n")
-print("RELEASE=fixed-4-node-physical-isolation-v5",flush=True); print("ARCHITECTURE=physical-four-entry",flush=True); print("SUBSCRIPTION_INVARIANT=4",flush=True); print("443 -> 8080 -> 10086 XHTTP TLS",flush=True); print(f"{p1['domain']}:{p1['port']} -> 8081 -> 10087 RAW REALITY Vision",flush=True); print(f"{p2['domain']}:{p2['port']} -> 8082 -> 10088 gRPC REALITY",flush=True); print(f"{p3['domain']}:{p3['port']} -> 8083 -> 10089 WS TLS",flush=True); print("NODES=4",flush=True)
+(D/"manifest.json").write_text(json.dumps({"schema":10,"build":"fixed-4-node-physical-isolation-v6","node_count":4,"architecture":"physical-four-entry","distribution":{"443":"xhttp-tls","8081":"raw-reality-vision","8082":"grpc-reality","8083":"ws-tls"},"state_fingerprint":fingerprint},indent=2)+"\n")
+print("RELEASE=fixed-4-node-physical-isolation-v6",flush=True); print("ARCHITECTURE=physical-four-entry",flush=True); print("SUBSCRIPTION_INVARIANT=4",flush=True); print("443 -> 8080 -> 10086 XHTTP TLS",flush=True); print(f"{p1['domain']}:{p1['port']} -> 8081 -> 10087 RAW REALITY Vision",flush=True); print(f"{p2['domain']}:{p2['port']} -> 8082 -> 10088 gRPC REALITY",flush=True); print(f"{p3['domain']}:{p3['port']} -> 8083 -> 10089 WS TLS",flush=True); print("NODES=4",flush=True)

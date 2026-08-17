@@ -2,37 +2,61 @@
 import hashlib,json,os,re,secrets,urllib.parse
 from pathlib import Path
 
-# STABLE 2-NODE / SINGLE-8080 ROUTER
-# 01 Railway Domain :443 -> 8080 -> 10086 XHTTP (Railway terminates TLS)
-# 02 TCP Proxy :random -> 8080 -> SNI -> 10087 XHTTP + REALITY
+# STABLE 3-NODE / SINGLE-8080 ROUTER
+# 01 Railway Domain :443 -> 8080 -> 10086 XHTTP (Railway TLS edge)
+# 02 TCP Proxy :random -> 8080 -> SNI RAW REALITY -> 10087 Vision
+# 03 TCP Proxy :random -> 8080 -> SNI XHTTP REALITY -> 10088 XHTTP
+# 04 TCP Proxy :random -> 8080 -> SNI RAW REALITY -> 10089 Vision
+# One Railway TCP Proxy endpoint can therefore carry all three TCP nodes;
+# the gateway distinguishes them by TLS SNI.
 D=Path(os.environ.get('DATA_DIR','/data'));D.mkdir(parents=True,exist_ok=True)
 C=Path(os.environ.get('XRAY_CONFIG','/etc/xray/config.json'))
 UUID=os.environ['UUID'].strip();PRIVATE_KEY=os.environ['PRIVATE_KEY'].strip();PUBLIC_KEY=os.environ['PUBLIC_KEY'].strip();PUBLIC_DOMAIN=os.environ['PUBLIC_DOMAIN'].strip()
-APP_PORT=8080;NODE_COUNT=2
+APP_PORT=8080;NODE_COUNT=3
 h=(os.environ.get('RAILWAY_TCP_PROXY_DOMAIN') or '').strip();p0=(os.environ.get('RAILWAY_TCP_PROXY_PORT') or '').strip()
 if not h or not p0:raise SystemExit('FATAL: RAILWAY_TCP_PROXY_DOMAIN/PORT required')
 try:p=int(p0)
 except ValueError:raise SystemExit(f'FATAL: invalid RAILWAY_TCP_PROXY_PORT={p0!r}')
 if not 1<=p<=65535:raise SystemExit('FATAL: invalid TCP proxy port')
 FP=os.environ.get('REALITY_FINGERPRINT','chrome').strip() or 'chrome'
-SNI=os.environ.get('REALITY_RAW_SNI','www.cloudflare.com').strip() or 'www.cloudflare.com'
-TARGET=os.environ.get('REALITY_RAW_TARGET','www.cloudflare.com:443').strip() or 'www.cloudflare.com:443'
+RAW1_SNI=os.environ.get('REALITY_RAW_SNI','www.cloudflare.com').strip() or 'www.cloudflare.com'
+XHTTP_SNI=os.environ.get('REALITY_XHTTP_SNI','www.apple.com').strip() or 'www.apple.com'
+RAW2_SNI=os.environ.get('REALITY_RAW2_SNI','www.bing.com').strip() or 'www.bing.com'
+RAW1_TARGET=os.environ.get('REALITY_RAW_TARGET','www.cloudflare.com:443').strip() or 'www.cloudflare.com:443'
+XHTTP_TARGET=os.environ.get('REALITY_XHTTP_TARGET','www.apple.com:443').strip() or 'www.apple.com:443'
+RAW2_TARGET=os.environ.get('REALITY_RAW2_TARGET','www.bing.com:443').strip() or 'www.bing.com:443'
 XPATH=os.environ.get('XHTTP_PATH','/xhttp').strip() or '/xhttp'
 ids_file=D/'reality_short_ids.json'
 try:ids=json.loads(ids_file.read_text()) if ids_file.exists() else []
 except Exception:ids=[]
 ids=[str(x) for x in ids if re.fullmatch(r'[0-9a-fA-F]{2,32}',str(x))]
-if not ids:ids=[secrets.token_hex(6)]
-SID=ids[0];ids_file.write_text(json.dumps([SID],indent=2)+'\n')
-xhttp={'tag':'vless-xhttp-http','listen':'127.0.0.1','port':10086,'protocol':'vless','settings':{'clients':[{'id':UUID,'level':0}],'decryption':'none'},'streamSettings':{'network':'xhttp','security':'none','xhttpSettings':{'path':XPATH,'mode':'auto'}}}
-reality={'tag':'vless-xhttp-reality','listen':'127.0.0.1','port':10087,'protocol':'vless','settings':{'clients':[{'id':UUID,'level':0}],'decryption':'none'},'streamSettings':{'network':'xhttp','security':'reality','realitySettings':{'show':False,'target':TARGET,'serverNames':[SNI],'privateKey':PRIVATE_KEY,'shortIds':[SID]},'xhttpSettings':{'path':XPATH,'mode':'auto'}}}
-C.write_text(json.dumps({'log':{'loglevel':os.environ.get('XRAY_LOGLEVEL','warning')},'policy':{'levels':{'0':{'handshake':8,'connIdle':900,'uplinkOnly':2,'downlinkOnly':5}}},'inbounds':[xhttp,reality],'outbounds':[{'tag':'direct','protocol':'freedom'},{'tag':'block','protocol':'blackhole'}]},indent=2)+'\n')
+while len(ids)<3:ids.append(secrets.token_hex(6))
+ids=ids[:3];ids_file.write_text(json.dumps(ids,indent=2)+'\n')
+
+def inbound(tag,port,network,sni,target,sid,flow=''):
+    client={'id':UUID,'level':0}
+    if flow:client['flow']=flow
+    ss={'network':network,'security':'reality','realitySettings':{'show':False,'target':target,'serverNames':[sni],'privateKey':PRIVATE_KEY,'shortIds':[sid]}}
+    if network=='xhttp':ss['xhttpSettings']={'path':XPATH,'mode':'auto'}
+    return {'tag':tag,'listen':'127.0.0.1','port':port,'protocol':'vless','settings':{'clients':[client],'decryption':'none'},'streamSettings':ss}
+
+# Internal Xray listeners. Railway itself only exposes 8080.
+xhttp_tls={'tag':'vless-xhttp-http','listen':'127.0.0.1','port':10086,'protocol':'vless','settings':{'clients':[{'id':UUID,'level':0}],'decryption':'none'},'streamSettings':{'network':'xhttp','security':'none','xhttpSettings':{'path':XPATH,'mode':'auto'}}}
+raw1=inbound('vless-reality-vision-01',10087,'tcp',RAW1_SNI,RAW1_TARGET,ids[0],'xtls-rprx-vision')
+xhttp_reality=inbound('vless-xhttp-reality',10088,'xhttp',XHTTP_SNI,XHTTP_TARGET,ids[1])
+raw2=inbound('vless-reality-vision-02',10089,'tcp',RAW2_SNI,RAW2_TARGET,ids[2],'xtls-rprx-vision')
+config={'log':{'loglevel':os.environ.get('XRAY_LOGLEVEL','warning')},'policy':{'levels':{'0':{'handshake':8,'connIdle':900,'uplinkOnly':2,'downlinkOnly':5}}},'inbounds':[xhttp_tls,raw1,xhttp_reality,raw2],'outbounds':[{'tag':'direct','protocol':'freedom'},{'tag':'block','protocol':'blackhole'}]}
+C.write_text(json.dumps(config,indent=2)+'\n')
+
 def q(d):return urllib.parse.urlencode({k:str(v) for k,v in d.items() if v not in (None,'')},safe='')
 def link(host,port,params,name):return f'vless://{UUID}@{host}:{port}?{q(params)}#{urllib.parse.quote(name,safe="")}'
-lines=[link(PUBLIC_DOMAIN,443,{'encryption':'none','security':'tls','sni':PUBLIC_DOMAIN,'fp':FP,'alpn':'h2,http/1.1','type':'xhttp','path':XPATH,'mode':'auto'},'VLESS XHTTP TLS · Railway Domain'),link(h,p,{'encryption':'none','security':'reality','sni':SNI,'fp':FP,'pbk':PUBLIC_KEY,'sid':SID,'type':'xhttp','path':XPATH,'mode':'auto'},'VLESS XHTTP REALITY · TCP Proxy')]
+lines=[
+ link(h,p,{'encryption':'none','flow':'xtls-rprx-vision','security':'reality','sni':RAW1_SNI,'fp':FP,'pbk':PUBLIC_KEY,'sid':ids[0],'type':'tcp'},'VLESS RAW REALITY Vision 01 · TCP Proxy'),
+ link(h,p,{'encryption':'none','security':'reality','sni':XHTTP_SNI,'fp':FP,'pbk':PUBLIC_KEY,'sid':ids[1],'type':'xhttp','path':XPATH,'mode':'auto'},'VLESS XHTTP REALITY 02 · TCP Proxy'),
+ link(h,p,{'encryption':'none','flow':'xtls-rprx-vision','security':'reality','sni':RAW2_SNI,'fp':FP,'pbk':PUBLIC_KEY,'sid':ids[2],'type':'tcp'},'VLESS RAW REALITY Vision 03 · TCP Proxy')]
 if len(lines)!=NODE_COUNT:raise SystemExit(f'FATAL: expected {NODE_COUNT} nodes, got {len(lines)}')
-state={'schema':14,'build':'stable-2node-single-8080','architecture':'single-8080-router','node_count':2,'application_port':8080,'public_domain':PUBLIC_DOMAIN,'tcp_proxy':{'domain':h,'port':p,'application_port':8080},'reality':{'sni':SNI,'target':TARGET,'short_id':SID},'xhttp_path':XPATH}
+state={'schema':15,'build':'stable-3node-single-8080','architecture':'single-8080-sni-router','node_count':3,'application_port':8080,'tcp_proxy':{'domain':h,'port':p,'application_port':8080},'routes':{'raw1':{'sni':RAW1_SNI,'port':10087,'short_id':ids[0]},'xhttp':{'sni':XHTTP_SNI,'port':10088,'short_id':ids[1]},'raw2':{'sni':RAW2_SNI,'port':10089,'short_id':ids[2]}} ,'xhttp_path':XPATH}
 state['fingerprint']=hashlib.sha256(json.dumps(state,sort_keys=True,separators=(',',':')).encode()).hexdigest()
 (D/'state.json').write_text(json.dumps(state,indent=2)+'\n');(D/'subscription.txt.tmp').write_text('\n'.join(lines)+'\n');os.replace(D/'subscription.txt.tmp',D/'subscription.txt')
-(D/'manifest.json').write_text(json.dumps({'schema':14,'build':'stable-2node-single-8080','node_count':2,'application_port':8080,'distribution':{'443':'xhttp-tls','tcp-proxy':'xhttp-reality'},'state_fingerprint':state['fingerprint']},indent=2)+'\n')
-print('RELEASE=stable-2node-single-8080',flush=True);print('SUBSCRIPTION_INVARIANT=2',flush=True);print(f'DOMAIN {PUBLIC_DOMAIN}:443 -> 8080 -> 10086 XHTTP',flush=True);print(f'TCP {h}:{p} -> 8080 -> SNI {SNI} -> 10087 XHTTP REALITY',flush=True);print('NODES=2',flush=True)
+(D/'manifest.json').write_text(json.dumps({'schema':15,'build':'stable-3node-single-8080','node_count':3,'application_port':8080,'distribution':{'tcp-proxy-1':'raw-reality-vision','tcp-proxy-2':'xhttp-reality','tcp-proxy-3':'raw-reality-vision'},'state_fingerprint':state['fingerprint']},indent=2)+'\n')
+print('RELEASE=stable-3node-single-8080',flush=True);print('SUBSCRIPTION_INVARIANT=3',flush=True);print(f'TCP {h}:{p} -> 8080 -> {RAW1_SNI} -> 10087 RAW REALITY Vision',flush=True);print(f'TCP {h}:{p} -> 8080 -> {XHTTP_SNI} -> 10088 XHTTP REALITY',flush=True);print(f'TCP {h}:{p} -> 8080 -> {RAW2_SNI} -> 10089 RAW REALITY Vision',flush=True);print('NODES=3',flush=True)

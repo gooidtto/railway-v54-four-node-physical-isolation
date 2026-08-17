@@ -1,19 +1,19 @@
 {
-  "release": "fixed-4-node-physical-isolation-v4",
-  "architecture": "one-xray-core-four-physical-entry-paths",
+  "release": "fixed-single-8080-router-v1",
+  "architecture": "single-8080-protocol-router",
   "nodes": 4,
+  "application_port": 8080,
   "entries": {
     "443": "xhttp-tls",
-    "23337": "raw-reality-vision",
-    "23389": "grpc-reality",
-    "17903": "ws-tls"
+    "tcp-proxy-1": "raw-reality-vision",
+    "tcp-proxy-2": "grpc-reality",
+    "tcp-proxy-3": "ws-tls"
   },
-  "gateway_ports": {
-    "8080": 10086,
-    "8081": 10087,
-    "8082": 10088,
-    "8083": 10089
+  "routing": {
+    "http": 10086,
+    "raw_reality_sni": 10087,
+    "grpc_reality_sni": 10088,
+    "ws_sni": 10089
   },
-  "reality_sni_count": 1,
   "source_of_truth": "main"
 }

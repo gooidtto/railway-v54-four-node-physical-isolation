@@ -1,115 +1,92 @@
-# Railway VLESS — Fixed 8-Node Baseline
+# Railway VLESS — Fixed 8-Node / Three-TCP Baseline
 
-This is the restored, fixed baseline: **one HTTPS XHTTP node + seven REALITY Vision SNI nodes**. It deliberately avoids the multi-TCP-Proxy topology and Railway API discovery used by the failed v54 experiment.
+This version matches the current Railway Networking layout instead of silently using only the first TCP Proxy.
 
-## Topology
-
-```text
-                         Railway
-                            │
-              ┌─────────────┴─────────────┐
-              │                           │
-      Generate Domain                 TCP Proxy
-      *.up.railway.app               *.proxy.rlwy.net:*
-              │                           │
-              │ HTTPS / L7               │ raw TCP
-              ▼                           ▼
-            :8080                       :8080
-         HTTP/TLS gateway          same gateway listener
-              │                           │
-              ▼                           │ TLS ClientHello
-        127.0.0.1:10086                  │
-        VLESS + XHTTP                    ▼
-        security=none              127.0.0.1:10087
-        (Railway terminates TLS)   VLESS + TCP + REALITY
-                                         │
-                                  7 fixed serverNames
-```
-
-The gateway has exactly two protocol paths:
+## Current Railway Networking
 
 ```text
-HTTP request / HTTP/2 → 10086 → VLESS XHTTP
-TLS ClientHello       → 10087 → VLESS REALITY + Vision
+Generate Domain
+<railway-domain>.up.railway.app -> 8080
+
+TCP Proxy #1
+reseau.proxy.rlwy.net:23337 -> 8081
+
+TCP Proxy #2
+interchange.proxy.rlwy.net:23389 -> 8082
+
+TCP Proxy #3
+altaria.proxy.rlwy.net:17903 -> 8083
 ```
 
-No fallback chain and no second proxy core are used.
-
-## Railway Networking
-
-Create only:
-
-1. Generate Domain → target/application port `8080`
-2. **One** TCP Proxy → target/application port `8080`
-
-Railway supplies the TCP Proxy's public domain and external port through:
+The three TCP proxy public endpoints are runtime-configurable through:
 
 ```text
 RAILWAY_TCP_PROXY_DOMAIN
 RAILWAY_TCP_PROXY_PORT
-RAILWAY_TCP_APPLICATION_PORT=8080
+RAILWAY_TCP_APPLICATION_PORT
+
+RAILWAY_TCP_PROXY_2_DOMAIN
+RAILWAY_TCP_PROXY_2_PORT
+RAILWAY_TCP_PROXY_2_APPLICATION_PORT
+
+RAILWAY_TCP_PROXY_3_DOMAIN
+RAILWAY_TCP_PROXY_3_PORT
+RAILWAY_TCP_PROXY_3_APPLICATION_PORT
 ```
 
-The startup script reads these values directly. The public endpoint is not copied from persistent state.
+The defaults are the current Networking values above.
+
+## Data flow
+
+```text
+Generate Domain :443
+        |
+        v
+Gateway :8080
+        |
+        v
+Xray 127.0.0.1:10086
+VLESS + XHTTP (security=none)
+
+TCP #1 :23337 -> 8081 ----+
+TCP #2 :23389 -> 8082 ----+--> Gateway --> Xray 127.0.0.1:10087
+TCP #3 :17903 -> 8083 ----+    VLESS + TCP + REALITY + Vision
+```
+
+All three TCP targets are separate Gateway listeners, but they deliberately feed the same REALITY listener. There is no fallback chain and no second proxy core.
 
 ## Fixed eight nodes
 
 The subscription contains exactly eight VLESS links:
 
-1. `VLESS XHTTP TLS` — `https://<railway-domain>:443`
-2. `VLESS REALITY Vision 01` — SNI `www.cloudflare.com`
-3. `VLESS REALITY Vision 02` — SNI `www.bing.com`
-4. `VLESS REALITY Vision 03` — SNI `www.canva.com`
-5. `VLESS REALITY Vision 04` — SNI `www.notion.so`
-6. `VLESS REALITY Vision 05` — SNI `store.epicgames.com`
-7. `VLESS REALITY Vision 06` — SNI `www.gog.com`
-8. `VLESS REALITY Vision 07` — SNI `www.gamespot.com`
+1. `VLESS XHTTP TLS` — Railway Domain `:443`
+2-4. `VLESS REALITY Vision` — TCP Proxy #1 (`reseau:23337 -> 8081`), SNI 01-03
+5-6. `VLESS REALITY Vision` — TCP Proxy #2 (`interchange:23389 -> 8082`), SNI 04-05
+7-8. `VLESS REALITY Vision` — TCP Proxy #3 (`altaria:17903 -> 8083`), SNI 06-07
 
-The seven SNI values are fixed in `config/reality-sni-candidates.txt`; startup fails if the list is not exactly seven entries.
-
-The seven REALITY nodes all use the same Railway TCP Proxy endpoint and the same REALITY keypair/short ID. Their only intentional profile difference is the SNI/serverName.
-
-## Persistent state
-
-The volume persists only cryptographic identity and subscription authentication state:
+The seven fixed SNI values remain:
 
 ```text
-UUID
-REALITY private/public key
-short ID
-subscription token
+www.cloudflare.com
+www.bing.com
+www.canva.com
+www.notion.so
+store.epicgames.com
+www.gog.com
+www.gamespot.com
 ```
 
-The Railway TCP Proxy hostname and external port are runtime values and are never restored from the volume.
-
-## Expected startup
+The server uses one Xray core with two private inbounds:
 
 ```text
-BUILD=fixed-8-node-baseline
-TCP_PROXY=<current-railway-tcp-domain>:<current-port> -> gateway:8080
-REALITY=127.0.0.1:10087 SNI_COUNT=7
-XHTTP_TLS=<railway-domain>:443 -> 127.0.0.1:10086
-NODES=8 (1 HTTPS XHTTP + 7 REALITY Vision SNI)
-READY: build=fixed-8-node-baseline gateway=8080 xray_reality=10087 xray_xhttp=10086 ...
+10086 -> VLESS + XHTTP
+10087 -> VLESS + TCP + REALITY + Vision (7 SNI)
 ```
 
-## Subscription
+The three Railway TCP proxies are physical/public entry separation only; they do not create additional Xray inbounds.
 
-After deployment:
+## Important
 
-```text
-https://<your-railway-domain>/sub/<generated-token>
-```
+Do not add a fourth TCP Proxy. Do not add 8084. Do not enable WS in this baseline.
 
-The response is Base64 encoded and contains exactly eight VLESS links.
-
-## Xray
-
-One Xray core is used. The private listeners are:
-
-```text
-10086 → VLESS + XHTTP (Railway HTTPS already terminated)
-10087 → VLESS + TCP + REALITY + Vision (seven SNI profiles)
-```
-
-The next three experimental protocols are intentionally **not included** in this baseline. They should only be tested after this eight-node baseline is confirmed stable.
+If Railway regenerates any TCP external port, set the corresponding `RAILWAY_TCP_PROXY_*` variables to the new values. The subscription is generated from those runtime values, not from persisted old state.

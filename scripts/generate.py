@@ -35,15 +35,24 @@ RAW_TARGET = os.environ.get("REALITY_RAW_TARGET", "www.cloudflare.com:443").stri
 XHTTP_TARGET = os.environ.get("REALITY_XHTTP_TARGET", "www.apple.com:443").strip() or "www.apple.com:443"
 XPATH = os.environ.get("XHTTP_PATH", "/xhttp").strip() or "/xhttp"
 
-CF_TOKEN = os.environ.get("CLOUDFLARE_TUNNEL_TOKEN", "").strip()
-CF_HOST = os.environ.get("CLOUDFLARE_PUBLIC_HOSTNAME", "").strip().lower()
-CF_ORIGIN = os.environ.get("CLOUDFLARE_ORIGIN_SERVICE", "").strip()
-CF_PORT_RAW = os.environ.get("WS_PORT", "").strip()
-CF_PATH = os.environ.get("WS_PATH", "").strip()
-CF_ID = os.environ.get("CLOUDFLARE_TUNNEL_ID", "").strip()
+# Cloudflare variables are read once here.  runtime.json is the frozen
+# single source of truth consumed by start.sh and all diagnostics.
+def env_first(*names):
+    for name in names:
+        value = (os.environ.get(name) or "").strip()
+        if value:
+            return value
+    return ""
 
-# This is the ONLY place that derives Cloudflare enablement from Railway ENV.
-# All later processes consume /data/runtime.json instead of re-evaluating ENV.
+CF_TOKEN = env_first("CLOUDFLARE_TUNNEL_TOKEN", "CF_TUNNEL_TOKEN", "TUNNEL_TOKEN")
+CF_HOST = env_first("CLOUDFLARE_PUBLIC_HOSTNAME", "CF_PUBLIC_HOSTNAME").lower()
+CF_ORIGIN = env_first("CLOUDFLARE_ORIGIN_SERVICE", "CF_ORIGIN_SERVICE")
+CF_PORT_RAW = env_first("WS_PORT", "CLOUDFLARE_WS_PORT", "CF_WS_PORT")
+CF_PATH = env_first("WS_PATH", "CLOUDFLARE_WS_PATH", "CF_WS_PATH")
+CF_ID = env_first("CLOUDFLARE_TUNNEL_ID", "CF_TUNNEL_ID", "TUNNEL_ID")
+
+# Four-node mode is enabled only when the complete runtime contract exists.
+# Tunnel ID is metadata only; the tunnel token is the runtime credential.
 CF_ENABLED = bool(CF_TOKEN and CF_HOST and CF_ORIGIN and CF_PORT_RAW and CF_PATH)
 CF_PORT = None
 CF_INVALID_REASON = ""
@@ -68,9 +77,7 @@ if CF_ENABLED:
         CF_INVALID_REASON = "CLOUDFLARE_ORIGIN_SERVICE must be http://127.0.0.1:<WS_PORT>"
 
 if CF_ENABLED and CF_ORIGIN != f"http://127.0.0.1:{CF_PORT}":
-    raise SystemExit(
-        f"FATAL: CLOUDFLARE_ORIGIN_SERVICE must equal http://127.0.0.1:{CF_PORT}"
-    )
+    raise SystemExit(f"FATAL: CLOUDFLARE_ORIGIN_SERVICE must equal http://127.0.0.1:{CF_PORT}")
 
 ids_file = D / "reality_short_ids.json"
 try:
@@ -124,131 +131,69 @@ xhttp_tls = {
     },
 }
 
-raw = reality(
-    "vless-reality-vision", 10087, "tcp", RAW_SNI, RAW_TARGET, ids[0], "xtls-rprx-vision"
-)
-xhttp_reality = reality(
-    "vless-xhttp-reality", 10088, "xhttp", XHTTP_SNI, XHTTP_TARGET, ids[1]
-)
+raw = reality("vless-reality-vision", 10087, "tcp", RAW_SNI, RAW_TARGET, ids[0], "xtls-rprx-vision")
+xhttp_reality = reality("vless-xhttp-reality", 10088, "xhttp", XHTTP_SNI, XHTTP_TARGET, ids[1])
 inbounds = [xhttp_tls, raw, xhttp_reality]
 
 if CF_ENABLED:
-    inbounds.append(
-        {
-            "tag": "vless-ws-cloudflare",
-            "listen": "127.0.0.1",
-            "port": CF_PORT,
-            "protocol": "vless",
-            "settings": {
-                "clients": [{"id": UUID, "level": 0}],
-                "decryption": "none",
-            },
-            "streamSettings": {
-                "network": "ws",
-                "security": "none",
-                "wsSettings": {"path": CF_PATH},
-            },
-        }
-    )
+    inbounds.append({
+        "tag": "vless-ws-cloudflare",
+        "listen": "127.0.0.1",
+        "port": CF_PORT,
+        "protocol": "vless",
+        "settings": {"clients": [{"id": UUID, "level": 0}], "decryption": "none"},
+        "streamSettings": {
+            "network": "ws",
+            "security": "none",
+            "wsSettings": {"path": CF_PATH},
+        },
+    })
 
 config = {
     "log": {"loglevel": os.environ.get("XRAY_LOGLEVEL", "warning")},
     "policy": {"levels": {"0": {"handshake": 8, "connIdle": 900, "uplinkOnly": 2, "downlinkOnly": 5}}},
     "inbounds": inbounds,
-    "outbounds": [
-        {"tag": "direct", "protocol": "freedom"},
-        {"tag": "block", "protocol": "blackhole"},
-    ],
+    "outbounds": [{"tag": "direct", "protocol": "freedom"}, {"tag": "block", "protocol": "blackhole"}],
 }
 C.write_text(json.dumps(config, indent=2) + "\n")
 
 
 def q(d):
-    return urllib.parse.urlencode(
-        {k: str(v) for k, v in d.items() if v not in (None, "")}, safe=""
-    )
+    return urllib.parse.urlencode({k: str(v) for k, v in d.items() if v not in (None, "")}, safe="")
 
 
 def link(host, port, params, name):
     return f'vless://{UUID}@{host}:{port}?{q(params)}#{urllib.parse.quote(name, safe="")}'
 
-
 lines = [
-    link(
-        PUBLIC_DOMAIN,
-        443,
-        {
-            "encryption": "none",
-            "security": "tls",
-            "sni": PUBLIC_DOMAIN,
-            "fp": FP,
-            "alpn": "h2,http/1.1",
-            "type": "xhttp",
-            "path": XPATH,
-            "mode": "auto",
-        },
-        "VLESS XHTTP TLS · Railway Domain",
-    ),
-    link(
-        TCP_HOST,
-        TCP_PORT,
-        {
-            "encryption": "none",
-            "flow": "xtls-rprx-vision",
-            "security": "reality",
-            "sni": RAW_SNI,
-            "fp": FP,
-            "pbk": PUBLIC_KEY,
-            "sid": ids[0],
-            "type": "tcp",
-        },
-        "VLESS RAW REALITY Vision · TCP Proxy",
-    ),
-    link(
-        TCP_HOST,
-        TCP_PORT,
-        {
-            "encryption": "none",
-            "security": "reality",
-            "sni": XHTTP_SNI,
-            "fp": FP,
-            "alpn": "h2",
-            "pbk": PUBLIC_KEY,
-            "sid": ids[1],
-            "type": "xhttp",
-            "path": XPATH,
-            "mode": "auto",
-        },
-        "VLESS XHTTP REALITY · TCP Proxy",
-    ),
+    link(PUBLIC_DOMAIN, 443, {
+        "encryption": "none", "security": "tls", "sni": PUBLIC_DOMAIN,
+        "fp": FP, "alpn": "h2,http/1.1", "type": "xhttp", "path": XPATH, "mode": "auto",
+    }, "VLESS XHTTP TLS · Railway Domain"),
+    link(TCP_HOST, TCP_PORT, {
+        "encryption": "none", "flow": "xtls-rprx-vision", "security": "reality",
+        "sni": RAW_SNI, "fp": FP, "pbk": PUBLIC_KEY, "sid": ids[0], "type": "tcp",
+    }, "VLESS RAW REALITY Vision · TCP Proxy"),
+    link(TCP_HOST, TCP_PORT, {
+        "encryption": "none", "security": "reality", "sni": XHTTP_SNI,
+        "fp": FP, "alpn": "h2", "pbk": PUBLIC_KEY, "sid": ids[1],
+        "type": "xhttp", "path": XPATH, "mode": "auto",
+    }, "VLESS XHTTP REALITY · TCP Proxy"),
 ]
 
 if CF_ENABLED:
-    lines.append(
-        link(
-            CF_HOST,
-            443,
-            {
-                "encryption": "none",
-                "security": "tls",
-                "sni": CF_HOST,
-                "fp": FP,
-                "alpn": "http/1.1",
-                "type": "ws",
-                "host": CF_HOST,
-                "path": CF_PATH,
-            },
-            "VLESS WS TLS · Cloudflare Tunnel",
-        )
-    )
+    lines.append(link(CF_HOST, 443, {
+        "encryption": "none", "security": "tls", "sni": CF_HOST, "fp": FP,
+        "alpn": "http/1.1", "type": "ws", "host": CF_HOST, "path": CF_PATH,
+    }, "VLESS WS TLS · Cloudflare Tunnel"))
 
-NODE_COUNT = 4 if CF_ENABLED else 3
-if len(lines) != NODE_COUNT:
-    raise SystemExit(f"FATAL: expected {NODE_COUNT} nodes, got {len(lines)}")
+NODE_COUNT = len(lines)
+if NODE_COUNT not in (3, 4):
+    raise SystemExit(f"FATAL: invalid node count: {NODE_COUNT}")
 
 runtime = {
-    "schema": 20,
-    "build": "stable-optional-cloudflare-ws",
+    "schema": 21,
+    "build": "stable-optional-cloudflare-ws-v2",
     "architecture": "single-8080-router-plus-optional-cloudflare-tunnel",
     "cloudflare": {
         "enabled": CF_ENABLED,
@@ -271,32 +216,24 @@ runtime = {
     },
     "application_port": APP_PORT,
     "public_domain": PUBLIC_DOMAIN,
-    "tcp_proxy": {
-        "domain": TCP_HOST,
-        "port": TCP_PORT,
-        "application_port": APP_PORT,
-    },
+    "tcp_proxy": {"domain": TCP_HOST, "port": TCP_PORT, "application_port": APP_PORT},
     "routes": {
         "domain_xhttp_tls": {"port": 10086},
         "raw_reality_vision": {"sni": RAW_SNI, "port": 10087, "short_id": ids[0]},
         "xhttp_reality": {"sni": XHTTP_SNI, "port": 10088, "short_id": ids[1]},
+        **({"cloudflare_ws_tls": {"host": CF_HOST, "port": CF_PORT, "path": CF_PATH}} if CF_ENABLED else {}),
     },
 }
-runtime["fingerprint"] = hashlib.sha256(
-    json.dumps(runtime, sort_keys=True, separators=(",", ":")).encode()
-).hexdigest()
+runtime["fingerprint"] = hashlib.sha256(json.dumps(runtime, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
-# /data/runtime.json is the single runtime truth consumed by start.sh and
-# diagnostics. It deliberately contains no secret token or private key.
 (D / "runtime.json").write_text(json.dumps(runtime, indent=2) + "\n")
 (D / "state.json").write_text(json.dumps(runtime, indent=2) + "\n")
-
 (D / "subscription.txt.tmp").write_text("\n".join(lines) + "\n")
 os.replace(D / "subscription.txt.tmp", D / "subscription.txt")
 
 manifest = {
-    "schema": 20,
-    "build": "stable-optional-cloudflare-ws",
+    "schema": 21,
+    "build": "stable-optional-cloudflare-ws-v2",
     "node_count": NODE_COUNT,
     "application_port": APP_PORT,
     "cloudflare_ws_enabled": CF_ENABLED,
@@ -305,7 +242,7 @@ manifest = {
 }
 (D / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
-print("RELEASE=stable-optional-cloudflare-ws", flush=True)
+print("RELEASE=stable-optional-cloudflare-ws-v2", flush=True)
 print("RUNTIME_STATE=/data/runtime.json", flush=True)
 print(f"RUNTIME_FINGERPRINT={runtime['fingerprint']}", flush=True)
 print(f"CLOUDFLARE_WS={'enabled' if CF_ENABLED else 'disabled'}", flush=True)
@@ -322,5 +259,5 @@ print(f"DOMAIN {PUBLIC_DOMAIN}:443 -> 8080 -> 10086 XHTTP TLS", flush=True)
 print(f"TCP {TCP_HOST}:{TCP_PORT} -> 8080 -> {RAW_SNI} -> 10087 RAW REALITY Vision", flush=True)
 print(f"TCP {TCP_HOST}:{TCP_PORT} -> 8080 -> {XHTTP_SNI} -> 10088 XHTTP REALITY", flush=True)
 if CF_ENABLED:
-    print(f"CF {CF_HOST}:443 -> tunnel -> {CF_ORIGIN} -> {CF_PORT} WS", flush=True)
+    print(f"CF {CF_HOST}:443 -> tunnel -> {CF_ORIGIN} -> {CF_PORT} WS TLS", flush=True)
 print(f"NODES={NODE_COUNT}", flush=True)

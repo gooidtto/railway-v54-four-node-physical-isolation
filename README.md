@@ -1,92 +1,71 @@
-# Railway VLESS — Fixed 8-Node / Three-TCP Baseline
+# Railway VLESS — Fixed 4-Node Physical Isolation v4
 
-This version matches the current Railway Networking layout instead of silently using only the first TCP Proxy.
+This is the only supported release on `main`. The deployment must expose exactly four VLESS nodes.
 
-## Current Railway Networking
+## Runtime topology
 
 ```text
-Generate Domain
-<railway-domain>.up.railway.app -> 8080
+Railway Public Domain :443
+        |
+        v
+Gateway :8080 -> Xray 127.0.0.1:10086
+VLESS + XHTTP + TLS
 
-TCP Proxy #1
-reseau.proxy.rlwy.net:23337 -> 8081
+TCP Proxy #1 -> 8081 -> 10087
+VLESS + RAW/TCP + REALITY + Vision
 
-TCP Proxy #2
-interchange.proxy.rlwy.net:23389 -> 8082
+TCP Proxy #2 -> 8082 -> 10088
+VLESS + gRPC + REALITY
 
-TCP Proxy #3
-altaria.proxy.rlwy.net:17903 -> 8083
+TCP Proxy #3 -> 8083 -> 10089
+VLESS + WS + TLS
 ```
 
-The three TCP proxy public endpoints are runtime-configurable through:
+## Exactly four subscription nodes
+
+1. Railway Public Domain `:443` — VLESS XHTTP TLS
+2. TCP Proxy #1 — VLESS RAW/TCP REALITY Vision
+3. TCP Proxy #2 — VLESS gRPC REALITY
+4. TCP Proxy #3 — VLESS WS TLS
+
+There is no 8-node mode, no 7-SNI distribution, and no `3+2+2` REALITY node generation in this release.
+
+## Runtime-only Railway networking
+
+The public domain and all TCP proxy domains/ports are read from Railway runtime variables. No old public endpoint is used as a fallback.
+
+Required variables:
 
 ```text
+RAILWAY_PUBLIC_DOMAIN
 RAILWAY_TCP_PROXY_DOMAIN
 RAILWAY_TCP_PROXY_PORT
 RAILWAY_TCP_APPLICATION_PORT
-
 RAILWAY_TCP_PROXY_2_DOMAIN
 RAILWAY_TCP_PROXY_2_PORT
 RAILWAY_TCP_PROXY_2_APPLICATION_PORT
-
 RAILWAY_TCP_PROXY_3_DOMAIN
 RAILWAY_TCP_PROXY_3_PORT
 RAILWAY_TCP_PROXY_3_APPLICATION_PORT
 ```
 
-The defaults are the current Networking values above.
-
-## Data flow
+The application targets must be exactly:
 
 ```text
-Generate Domain :443
-        |
-        v
-Gateway :8080
-        |
-        v
-Xray 127.0.0.1:10086
-VLESS + XHTTP (security=none)
-
-TCP #1 :23337 -> 8081 ----+
-TCP #2 :23389 -> 8082 ----+--> Gateway --> Xray 127.0.0.1:10087
-TCP #3 :17903 -> 8083 ----+    VLESS + TCP + REALITY + Vision
+8080 -> 10086
+8081 -> 10087
+8082 -> 10088
+8083 -> 10089
 ```
 
-All three TCP targets are separate Gateway listeners, but they deliberately feed the same REALITY listener. There is no fallback chain and no second proxy core.
+If any required Railway runtime value is missing or a target is incorrect, startup fails instead of silently deploying an old/default topology.
 
-## Fixed eight nodes
-
-The subscription contains exactly eight VLESS links:
-
-1. `VLESS XHTTP TLS` — Railway Domain `:443`
-2-4. `VLESS REALITY Vision` — TCP Proxy #1 (`reseau:23337 -> 8081`), SNI 01-03
-5-6. `VLESS REALITY Vision` — TCP Proxy #2 (`interchange:23389 -> 8082`), SNI 04-05
-7-8. `VLESS REALITY Vision` — TCP Proxy #3 (`altaria:17903 -> 8083`), SNI 06-07
-
-The seven fixed SNI values remain:
+## Deployment identity
 
 ```text
-www.cloudflare.com
-www.bing.com
-www.canva.com
-www.notion.so
-store.epicgames.com
-www.gog.com
-www.gamespot.com
+RELEASE=fixed-4-node-physical-isolation-v4
+SUBSCRIPTION_INVARIANT=4
+NODES=4
 ```
 
-The server uses one Xray core with two private inbounds:
-
-```text
-10086 -> VLESS + XHTTP
-10087 -> VLESS + TCP + REALITY + Vision (7 SNI)
-```
-
-The three Railway TCP proxies are physical/public entry separation only; they do not create additional Xray inbounds.
-
-## Important
-
-Do not add a fourth TCP Proxy. Do not add 8084. Do not enable WS in this baseline.
-
-If Railway regenerates any TCP external port, set the corresponding `RAILWAY_TCP_PROXY_*` variables to the new values. The subscription is generated from those runtime values, not from persisted old state.
+The old 8-node release manifest has been removed from the authoritative release definition. The persistent volume may retain credentials and keys, but generated node lists, manifests, state, and short-ID lists are recreated for the current four-node release.

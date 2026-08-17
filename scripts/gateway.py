@@ -5,7 +5,7 @@ import os
 import re
 from pathlib import Path
 
-LISTEN = ("0.0.0.0", 8080)
+PORTS = tuple(int(x.strip()) for x in os.environ.get("GATEWAY_PORTS", "8080,8081").split(",") if x.strip())
 HTTP_DEST = ("127.0.0.1", int(os.environ.get("XRAY_HTTP_PORT", "10086")))
 REALITY_DEST = ("127.0.0.1", int(os.environ.get("XRAY_REALITY_PORT", "10087")))
 DATA = Path(os.environ.get("DATA_DIR", "/data"))
@@ -53,7 +53,7 @@ async def relay_to(reader, writer, initial, dest, label):
         up_r, up = await asyncio.open_connection(*dest)
         up.write(initial)
         await up.drain()
-        print(f"[gateway] ROUTE={label} peer={writer.get_extra_info('peername')} target={dest[0]}:{dest[1]}", flush=True)
+        print(f"[gateway] ROUTE={label} port={writer.get_extra_info('sockname')[1]} peer={writer.get_extra_info('peername')} target={dest[0]}:{dest[1]}", flush=True)
         await asyncio.gather(pipe(reader, up), pipe(up_r, writer))
     except Exception as e:
         print(f"[gateway] relay={label} error={type(e).__name__}: {e}", flush=True)
@@ -122,10 +122,9 @@ async def handle(reader, writer):
             if not initial:
                 return
 
-            # The single Railway TCP Proxy and the Generate Domain both enter
-            # the same gateway. HTTP is sent to XHTTP; TLS ClientHello is sent
-            # byte-for-byte to the REALITY listener. No TLS termination occurs
-            # in the gateway.
+            # Both Railway entry ports terminate at this same protocol-aware
+            # gateway. HTTP goes to the private XHTTP listener; a TLS
+            # ClientHello is forwarded byte-for-byte to REALITY.
             if is_tls_client_hello(initial):
                 await relay_to(reader, writer, initial, REALITY_DEST, "tls-reality")
                 return
@@ -147,10 +146,16 @@ async def handle(reader, writer):
 
 
 async def main():
-    server = await asyncio.start_server(handle, *LISTEN, limit=65536)
-    print("GATEWAY_READY=8080 HTTP->10086 TLS->10087", flush=True)
-    async with server:
-        await server.serve_forever()
+    servers = []
+    for port in PORTS:
+        servers.append(await asyncio.start_server(handle, "0.0.0.0", port, limit=65536))
+    print(f"GATEWAY_READY=ports={','.join(map(str, PORTS))} HTTP->10086 TLS->10087", flush=True)
+    try:
+        await asyncio.gather(*(serve.serve_forever() for serve in servers))
+    finally:
+        for serve in servers:
+            serve.close()
+            await serve.wait_closed()
 
 
 if __name__ == "__main__":

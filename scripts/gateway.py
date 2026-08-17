@@ -2,17 +2,19 @@
 import asyncio,base64,os,re,struct,urllib.parse
 from pathlib import Path
 
-# STABLE 3-NODE / SINGLE-8080 ROUTER
-# HTTP -> 10086 XHTTP (TLS terminated by Railway Domain)
+# TEST 4-NODE / SINGLE-8080 ROUTER
+# HTTP -> 10086 XHTTP
 # SNI RAW1 -> 10087 REALITY Vision
 # SNI XHTTP -> 10088 XHTTP REALITY
 # SNI RAW2 -> 10089 REALITY Vision
+# SNI gRPC -> 10090 gRPC REALITY
 PORT=int(os.environ.get('GATEWAY_PORT','8080'));D=Path(os.environ.get('DATA_DIR','/data'));SITE=Path('/opt/xray/site/index.html')
 TOKEN=D/'subscription_token.txt';SUB=D/'subscription.txt';HTTP_DEST=('127.0.0.1',10086)
 ROUTES={
  os.environ.get('REALITY_RAW_SNI','www.cloudflare.com').strip() or 'www.cloudflare.com':('127.0.0.1',10087,'raw-reality-vision-01'),
  os.environ.get('REALITY_XHTTP_SNI','www.apple.com').strip() or 'www.apple.com':('127.0.0.1',10088,'xhttp-reality'),
  os.environ.get('REALITY_RAW2_SNI','www.bing.com').strip() or 'www.bing.com':('127.0.0.1',10089,'raw-reality-vision-02'),
+ os.environ.get('REALITY_GRPC_SNI','www.microsoft.com').strip() or 'www.microsoft.com':('127.0.0.1',10090,'grpc-reality'),
 }
 SEM=asyncio.Semaphore(int(os.environ.get('GATEWAY_MAX_CONNECTIONS','512')));TIMEOUT=float(os.environ.get('GATEWAY_READ_TIMEOUT','15'));MAX_INITIAL=65536
 HTTP=(b'GET ',b'POST ',b'HEAD ',b'PUT ',b'OPTIONS ',b'PATCH ',b'DELETE ',b'PRI * HTTP/2.0')
@@ -20,7 +22,7 @@ HTTP=(b'GET ',b'POST ',b'HEAD ',b'PUT ',b'OPTIONS ',b'PATCH ',b'DELETE ',b'PRI *
 def subscription(token):
     if not TOKEN.exists() or token!=TOKEN.read_text().strip():return None,'TOKEN_INVALID'
     lines=[x.strip() for x in SUB.read_text().splitlines() if x.strip()]
-    if len(lines)!=3 or any(not x.startswith('vless://') for x in lines):return None,'SUB_INVALID'
+    if len(lines)!=4 or any(not x.startswith('vless://') for x in lines):return None,'SUB_INVALID'
     return base64.b64encode('\n'.join(lines).encode()),'OK'
 
 def tls_sni(buf):

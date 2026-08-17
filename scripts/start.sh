@@ -2,7 +2,7 @@
 set -eu
 umask 077
 
-BUILD_ID="fixed-8-node-three-tcp-stable-reality-v3"
+BUILD_ID="fixed-8-node-three-tcp-dynamic-railway-domain-v4"
 D="${RAILWAY_VOLUME_MOUNT_PATH:-${DATA_DIR:-/data}}"
 C="${XRAY_CONFIG:-/etc/xray/config.json}"
 READY_FILE="${GATEWAY_READY_FILE:-$D/gateway.ready}"
@@ -15,6 +15,11 @@ write_secret() {
   chmod 600 "$tmp"
   mv -f "$tmp" "$file"
 }
+
+# Railway runtime is the single source of truth for the public Web hostname.
+# Never hardcode the hostname and never fall back to a persisted/custom value.
+PUBLIC_DOMAIN="${RAILWAY_PUBLIC_DOMAIN:-}"
+[ -n "$PUBLIC_DOMAIN" ] || { echo "ERROR: RAILWAY_PUBLIC_DOMAIN is unavailable; refusing to generate a guessed hostname" >&2; exit 1; }
 
 UUID_FILE="$D/uuid.txt"
 PRIV_FILE="$D/reality_private_key.txt"
@@ -35,10 +40,6 @@ else
 fi
 if [ -s "$TOKEN_FILE" ]; then TOKEN=$(tr -d '[:space:]' < "$TOKEN_FILE"); else TOKEN=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))'); write_secret "$TOKEN_FILE" "$TOKEN"; fi
 
-# Exact public hostname used by the current subscription/node requirement.
-# It can still be overridden explicitly, but no persisted RAILWAY_PUBLIC_DOMAIN
-# value is allowed to silently replace it.
-PUBLIC_DOMAIN="${SUBSCRIPTION_PUBLIC_DOMAIN:-ailway-v54-tion.up.railway.app}"
 TCP_HOST="${RAILWAY_TCP_PROXY_DOMAIN:-reseau.proxy.rlwy.net}"
 TCP_PORT="${RAILWAY_TCP_PROXY_PORT:-23337}"
 TCP_APP="${RAILWAY_TCP_APPLICATION_PORT:-8081}"
@@ -51,7 +52,7 @@ TCP3_APP="${RAILWAY_TCP_PROXY_3_APPLICATION_PORT:-8083}"
 
 case "$TCP_APP:$TCP2_APP:$TCP3_APP" in
   8081:8082:8083) : ;;
-  *) echo "TCP targets must be 8081:8082:8083; got $TCP_APP:$TCP2_APP:$TCP3_APP" >&2; exit 1 ;;
+  *) echo "ERROR: TCP targets must be 8081:8082:8083; got $TCP_APP:$TCP2_APP:$TCP3_APP" >&2; exit 1 ;;
 esac
 
 export DATA_DIR="$D" XRAY_CONFIG="$C"
@@ -67,6 +68,17 @@ export REALITY_SNI_CANDIDATES_FILE="${REALITY_SNI_CANDIDATES_FILE:-/opt/xray/con
 python3 /opt/xray/scripts/generate.py
 xray run -test -config "$C"
 
+# Verify the generated state uses exactly the runtime Railway hostname.
+python3 - "$D/state.json" "$PUBLIC_DOMAIN" <<'PY'
+import json, sys
+state = json.load(open(sys.argv[1], encoding="utf-8"))
+expected = sys.argv[2]
+actual = state.get("public_domain")
+if actual != expected:
+    raise SystemExit(f"PUBLIC_DOMAIN_MISMATCH generated={actual!r} runtime={expected!r}")
+PY
+
+a=0
 xray run -config "$C" &
 XP=$!
 GP=""
@@ -78,8 +90,8 @@ wait_port() {
     if python3 -c 'import socket,sys; s=socket.create_connection((sys.argv[1],int(sys.argv[2])),1); s.close()' "$host" "$port" 2>/dev/null; then
       echo "READY_CHECK=$label:$port"; return 0
     fi
-    if ! kill -0 "$XP" 2>/dev/null; then echo "xray exited before $label:$port became ready" >&2; exit 1; fi
-    i=$((i+1)); [ "$i" -lt "${READY_TIMEOUT:-90}" ] || { echo "readiness timeout waiting for $label:$port" >&2; exit 1; }; sleep 1
+    if ! kill -0 "$XP" 2>/dev/null; then echo "ERROR: xray exited before $label:$port became ready" >&2; exit 1; fi
+    i=$((i+1)); [ "$i" -lt "${READY_TIMEOUT:-90}" ] || { echo "ERROR: readiness timeout waiting for $label:$port" >&2; exit 1; }; sleep 1
   done
 }
 
@@ -100,11 +112,11 @@ chmod 600 "$READY_FILE"
 i=0
 while :; do
   if python3 -c 'import urllib.request; r=urllib.request.urlopen("http://127.0.0.1:8080/ready", timeout=2); raise SystemExit(0 if r.status == 200 and r.read() == b"ready\\n" else 1)' 2>/dev/null; then break; fi
-  i=$((i+1)); [ "$i" -lt "${READY_TIMEOUT:-90}" ] || { echo "gateway /ready verification failed" >&2; exit 1; }; sleep 1
+  i=$((i+1)); [ "$i" -lt "${READY_TIMEOUT:-90}" ] || { echo "ERROR: gateway /ready verification failed" >&2; exit 1; }; sleep 1
 done
 
 echo "BUILD=$BUILD_ID"
-echo "PUBLIC_DOMAIN=$PUBLIC_DOMAIN"
+echo "RAILWAY_PUBLIC_DOMAIN=$PUBLIC_DOMAIN (DYNAMIC RUNTIME VALUE)"
 echo "TCP_PROXY_1=${TCP_HOST}:${TCP_PORT} -> ${TCP_APP}"
 echo "TCP_PROXY_2=${TCP2_HOST}:${TCP2_PORT} -> ${TCP2_APP}"
 echo "TCP_PROXY_3=${TCP3_HOST}:${TCP3_PORT} -> ${TCP3_APP}"
@@ -115,5 +127,5 @@ echo "NODES=8 (1 HTTPS XHTTP + 7 REALITY Vision; TCP 3,2,2; unique short IDs)"
 echo "READY: build=$BUILD_ID gateway=8080,8081,8082,8083 xray_reality=10087 xray_xhttp=10086"
 
 while kill -0 "$XP" 2>/dev/null && kill -0 "$GP" 2>/dev/null; do sleep 5; done
-echo "supervised process exited" >&2
+echo "ERROR: supervised process exited" >&2
 exit 1

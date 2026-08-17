@@ -2,7 +2,7 @@
 set -eu
 umask 077
 
-BUILD_ID="fixed-8-node-three-tcp-stable-reality-v2"
+BUILD_ID="fixed-8-node-three-tcp-stable-reality-v3"
 D="${RAILWAY_VOLUME_MOUNT_PATH:-${DATA_DIR:-/data}}"
 C="${XRAY_CONFIG:-/etc/xray/config.json}"
 READY_FILE="${GATEWAY_READY_FILE:-$D/gateway.ready}"
@@ -35,7 +35,10 @@ else
 fi
 if [ -s "$TOKEN_FILE" ]; then TOKEN=$(tr -d '[:space:]' < "$TOKEN_FILE"); else TOKEN=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))'); write_secret "$TOKEN_FILE" "$TOKEN"; fi
 
-PUBLIC_DOMAIN="${PUBLIC_DOMAIN:-${RAILWAY_PUBLIC_DOMAIN:-}}"
+# Exact public hostname used by the current subscription/node requirement.
+# It can still be overridden explicitly, but no persisted RAILWAY_PUBLIC_DOMAIN
+# value is allowed to silently replace it.
+PUBLIC_DOMAIN="${SUBSCRIPTION_PUBLIC_DOMAIN:-ailway-v54-tion.up.railway.app}"
 TCP_HOST="${RAILWAY_TCP_PROXY_DOMAIN:-reseau.proxy.rlwy.net}"
 TCP_PORT="${RAILWAY_TCP_PROXY_PORT:-23337}"
 TCP_APP="${RAILWAY_TCP_APPLICATION_PORT:-8081}"
@@ -45,8 +48,6 @@ TCP2_APP="${RAILWAY_TCP_PROXY_2_APPLICATION_PORT:-8082}"
 TCP3_HOST="${RAILWAY_TCP_PROXY_3_DOMAIN:-altaria.proxy.rlwy.net}"
 TCP3_PORT="${RAILWAY_TCP_PROXY_3_PORT:-17903}"
 TCP3_APP="${RAILWAY_TCP_PROXY_3_APPLICATION_PORT:-8083}"
-
-[ -n "$PUBLIC_DOMAIN" ] || { echo "missing RAILWAY_PUBLIC_DOMAIN" >&2; exit 1; }
 
 case "$TCP_APP:$TCP2_APP:$TCP3_APP" in
   8081:8082:8083) : ;;
@@ -84,7 +85,6 @@ wait_port() {
 
 wait_port 127.0.0.1 10086 xray-xhttp
 wait_port 127.0.0.1 10087 xray-reality
-
 python3 /opt/xray/scripts/gateway.py &
 GP=$!
 wait_port 127.0.0.1 8080 gateway
@@ -104,7 +104,7 @@ while :; do
 done
 
 echo "BUILD=$BUILD_ID"
-echo "TOPOLOGY=GenerateDomain:443->gateway:8080->xhttp:10086; TCP1:${TCP_HOST}:${TCP_PORT}->gateway:${TCP_APP}->reality:10087; TCP2:${TCP2_HOST}:${TCP2_PORT}->gateway:${TCP2_APP}->reality:10087; TCP3:${TCP3_HOST}:${TCP3_PORT}->gateway:${TCP3_APP}->reality:10087"
+echo "PUBLIC_DOMAIN=$PUBLIC_DOMAIN"
 echo "TCP_PROXY_1=${TCP_HOST}:${TCP_PORT} -> ${TCP_APP}"
 echo "TCP_PROXY_2=${TCP2_HOST}:${TCP2_PORT} -> ${TCP2_APP}"
 echo "TCP_PROXY_3=${TCP3_HOST}:${TCP3_PORT} -> ${TCP3_APP}"

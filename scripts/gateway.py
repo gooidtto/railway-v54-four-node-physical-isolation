@@ -3,6 +3,7 @@ import asyncio
 import base64
 import os
 import re
+import urllib.parse
 from pathlib import Path
 
 PORTS = tuple(int(x.strip()) for x in os.environ.get("GATEWAY_PORTS", "8080,8081").split(",") if x.strip())
@@ -23,20 +24,40 @@ HTTP_PREFIXES = (
 
 
 def load_subscription(token, method):
-    expected = TOKEN.read_text().strip()
-    if token != expected:
+    try:
+        expected = TOKEN.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        print(f"[gateway] SUB_TOKEN_READ_ERROR={type(exc).__name__}:{exc}", flush=True)
+        return None, "SUB_READ_ERROR"
+
+    if not expected or token != expected:
         print(f"[gateway] SUB_TOKEN_INVALID expected_len={len(expected)} got_len={len(token)}", flush=True)
         return None, "TOKEN_INVALID"
-    raw = SUB.read_bytes()
+
+    try:
+        raw = SUB.read_bytes()
+    except OSError as exc:
+        print(f"[gateway] SUB_FILE_READ_ERROR={type(exc).__name__}:{exc}", flush=True)
+        return None, "SUB_READ_ERROR"
+
     if not raw.strip():
         print("[gateway] SUB_FILE_EMPTY", flush=True)
         return None, "SUB_FILE_EMPTY"
-    lines = [line.strip() for line in raw.decode("utf-8", "strict").splitlines() if line.strip()]
+
+    try:
+        lines = [line.strip() for line in raw.decode("utf-8").splitlines() if line.strip()]
+    except UnicodeDecodeError as exc:
+        print(f"[gateway] SUB_UTF8_ERROR={exc}", flush=True)
+        return None, "SUB_INVALID"
+
     if len(lines) != 8 or any(not line.startswith("vless://") for line in lines):
         print(f"[gateway] SUB_INVALID_LINES={len(lines)}", flush=True)
         return None, "SUB_INVALID"
-    payload = base64.b64encode(raw)
-    print(f"[gateway] SUB_REQUEST method={method} nodes={len(lines)} bytes={len(raw)} response=200", flush=True)
+
+    # Raw Base64, without line wrapping, is the most widely compatible
+    # subscription representation for VLESS clients.
+    payload = base64.b64encode("\n".join(lines).encode("utf-8"))
+    print(f"[gateway] SUB_REQUEST method={method} nodes={len(lines)} bytes={len(raw)} payload={len(payload)} response=200", flush=True)
     return payload, "OK"
 
 
@@ -112,56 +133,68 @@ async def relay_to(reader, writer, initial, dest, label):
 
 async def handle_http(reader, writer, initial):
     line = initial.split(b"\r\n", 1)[0].decode("latin1", "ignore")
-    m = re.match(r"^(GET|HEAD) /sub/([A-Za-z0-9_-]{20,128}) HTTP/", line)
-    if m:
-        method, token = m.group(1), m.group(2)
+    parts = line.split(" ", 2)
+    method = parts[0] if parts else ""
+    target = parts[1] if len(parts) > 1 else ""
+    parsed = urllib.parse.urlsplit(target)
+    path = parsed.path
+
+    # Accept optional query parameters/trailing slash so subscription clients
+    # that append cache-busters do not fall through to the XHTTP relay.
+    m = re.fullmatch(r"/sub/([A-Za-z0-9_-]{20,128})/?", path)
+    if method in ("GET", "HEAD") and m:
+        token = urllib.parse.unquote(m.group(1))
         try:
             payload, status = load_subscription(token, method)
-        except (OSError, UnicodeError) as exc:
-            print(f"[gateway] SUB_READ_ERROR={type(exc).__name__}:{exc}", flush=True)
+        except Exception as exc:
+            print(f"[gateway] SUB_UNEXPECTED_ERROR={type(exc).__name__}:{exc}", flush=True)
             payload, status = None, "SUB_READ_ERROR"
+
         if payload is not None:
-            if method == "HEAD":
-                response = (
-                    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n"
-                    b"Content-Length: " + str(len(payload)).encode() +
-                    b"\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
-                )
-            else:
-                response = (
-                    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n"
-                    b"Content-Length: " + str(len(payload)).encode() +
-                    b"\r\nCache-Control: no-store\r\nContent-Disposition: inline\r\nConnection: close\r\n\r\n" + payload
-                )
+            headers = (
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: text/plain; charset=utf-8\r\n"
+                b"Content-Transfer-Encoding: base64\r\n"
+                b"Cache-Control: no-store, no-cache, must-revalidate\r\n"
+                b"Pragma: no-cache\r\n"
+                b"Content-Disposition: inline\r\n"
+                b"Connection: close\r\n"
+                b"Content-Length: " + str(len(payload)).encode() + b"\r\n\r\n"
+            )
+            response = headers if method == "HEAD" else headers + payload
         else:
             body = (status + "\n").encode()
-            code = b"404 Not Found" if status in {"TOKEN_INVALID", "SUB_FILE_MISSING"} else b"500 Internal Server Error"
+            code = b"404 Not Found" if status == "TOKEN_INVALID" else b"500 Internal Server Error"
             response = (
-                b"HTTP/1.1 " + code + b"\r\nContent-Type: text/plain\r\n"
-                b"Content-Length: " + str(len(body)).encode() +
-                b"\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n" + body
+                b"HTTP/1.1 " + code + b"\r\n"
+                b"Content-Type: text/plain; charset=utf-8\r\n"
+                b"Cache-Control: no-store\r\n"
+                b"Connection: close\r\n"
+                b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
             )
         writer.write(response)
         await writer.drain()
         return
 
-    if line.startswith(("GET /ready", "HEAD /ready")):
+    if path == "/ready" and method in ("GET", "HEAD"):
         if gateway_ready():
             body = b"ready\n"
-            response = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 6\r\nConnection: close\r\n\r\n" + body
+            response = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 6\r\nConnection: close\r\n\r\n" + (b"" if method == "HEAD" else body)
         else:
             body = b"starting\n"
-            response = b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 9\r\nRetry-After: 2\r\nConnection: close\r\n\r\n" + body
+            response = b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 9\r\nRetry-After: 2\r\nConnection: close\r\n\r\n" + (b"" if method == "HEAD" else body)
         writer.write(response)
         await writer.drain()
         return
 
-    if line.startswith(("GET / ", "GET /index.html", "HEAD / ", "HEAD /index.html")):
+    if method in ("GET", "HEAD") and path in ("/", "/index.html"):
         body = SITE.read_bytes()
-        writer.write(
+        response = (
             b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n"
-            b"Content-Length: " + str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" + body
+            b"Content-Length: " + str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" +
+            (b"" if method == "HEAD" else body)
         )
+        writer.write(response)
         await writer.drain()
         return
 

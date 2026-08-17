@@ -1,124 +1,96 @@
-# Railway VLESS Four-Node — Physical Isolation
+# Railway VLESS — Fixed 8-Node Baseline
 
-This project implements the four-node topology without sharing a TCP listener between incompatible transports.
+This is the restored, fixed baseline: **one HTTPS XHTTP node + seven REALITY Vision SNI nodes**. It deliberately avoids the multi-TCP-Proxy topology and Railway API discovery used by the failed v54 experiment.
 
 ## Topology
 
 ```text
-Railway Generate Domain (*.up.railway.app)
-        │
-        │ HTTPS / L7
-        ▼
-      :8080
-   HTTP Gateway
-        │
-        ▼
-   127.0.0.1:10086
-   VLESS + XHTTP + TLS
-   (TLS terminates at Railway)
-
-TCP Proxy → application port 8081
-        │
-        ▼
-   VLESS + RAW/TCP + REALITY + Vision
-
-TCP Proxy → application port 8082
-        │
-        ▼
-   VLESS + XHTTP + REALITY
-
-TCP Proxy → application port 8083
-        │
-        ▼
-   VLESS + gRPC + REALITY
+                         Railway
+                            │
+              ┌─────────────┴─────────────┐
+              │                           │
+      Generate Domain                 TCP Proxy
+      *.up.railway.app               *.proxy.rlwy.net:*
+              │                           │
+              │ HTTPS / L7               │ raw TCP
+              ▼                           ▼
+            :8080                       :8080
+         HTTP/TLS gateway          same gateway listener
+              │                           │
+              ▼                           │ TLS ClientHello
+        127.0.0.1:10086                  │
+        VLESS + XHTTP                    ▼
+        security=none              127.0.0.1:10087
+        (Railway terminates TLS)   VLESS + TCP + REALITY
+                                         │
+                                  7 fixed serverNames
 ```
 
-### Physical isolation
+The gateway has exactly two protocol paths:
 
-A single Railway TCP Proxy cannot physically deliver three incompatible REALITY transports to three different Xray listeners. This version intentionally uses three TCP Proxy endpoints, each mapped to a dedicated internal port.
+```text
+HTTP request / HTTP/2 → 10086 → VLESS XHTTP
+TLS ClientHello       → 10087 → VLESS REALITY + Vision
+```
+
+No fallback chain and no second proxy core are used.
 
 ## Railway Networking
 
-Create:
+Create only:
 
 1. Generate Domain → target/application port `8080`
-2. TCP Proxy → target/application port `8081`
-3. TCP Proxy → target/application port `8082`
-4. TCP Proxy → target/application port `8083`
+2. **One** TCP Proxy → target/application port `8080`
 
-Railway generates the public domain and external proxy port for each TCP Proxy. The project can now discover all three endpoints dynamically from Railway's Public GraphQL API by matching `applicationPort`.
-
-## Dynamic TCP proxy discovery
-
-Set a Railway **Project Token** as a sealed service variable:
+Railway supplies the TCP Proxy's public domain and external port through:
 
 ```text
-RAILWAY_PROJECT_TOKEN=<your Railway project token>
-```
-
-The container already receives these Railway system variables:
-
-```text
-RAILWAY_SERVICE_ID
-RAILWAY_ENVIRONMENT_ID
 RAILWAY_TCP_PROXY_DOMAIN
 RAILWAY_TCP_PROXY_PORT
-RAILWAY_TCP_APPLICATION_PORT
+RAILWAY_TCP_APPLICATION_PORT=8080
 ```
 
-At startup, when `RAILWAY_PROJECT_TOKEN` (or `RAILWAY_API_TOKEN`) is present, `scripts/discover_tcp_proxies.py` queries:
+The startup script reads these values directly. The public endpoint is not copied from persistent state.
+
+## Fixed eight nodes
+
+The subscription contains exactly eight VLESS links:
+
+1. `VLESS XHTTP TLS` — `https://<railway-domain>:443`
+2. `VLESS REALITY Vision 01` — SNI `www.cloudflare.com`
+3. `VLESS REALITY Vision 02` — SNI `www.bing.com`
+4. `VLESS REALITY Vision 03` — SNI `www.canva.com`
+5. `VLESS REALITY Vision 04` — SNI `www.notion.so`
+6. `VLESS REALITY Vision 05` — SNI `store.epicgames.com`
+7. `VLESS REALITY Vision 06` — SNI `www.gog.com`
+8. `VLESS REALITY Vision 07` — SNI `www.gamespot.com`
+
+The seven SNI values are fixed in `config/reality-sni-candidates.txt`; startup fails if the list is not exactly seven entries.
+
+The seven REALITY nodes all use the same Railway TCP Proxy endpoint and the same REALITY keypair/short ID. Their only intentional profile difference is the SNI/serverName.
+
+## Persistent state
+
+The volume persists only cryptographic identity and subscription authentication state:
 
 ```text
-https://backboard.railway.com/graphql/v2
+UUID
+REALITY private/public key
+short ID
+subscription token
 ```
 
-using Railway's documented `tcpProxies(serviceId, environmentId)` query and selects proxies by their target application port:
+The Railway TCP Proxy hostname and external port are runtime values and are never restored from the volume.
+
+## Expected startup
 
 ```text
-8081 → Vision
-8082 → XHTTP REALITY
-8083 → gRPC REALITY
-```
-
-The discovered public host/port values are written only to a runtime temporary environment file and are **never persisted as subscription state**. This means a Railway-generated hostname or external port can change without requiring a code change or restoration of an old endpoint.
-
-For project tokens, the API uses Railway's `Project-Access-Token` header. Account/workspace tokens may instead be supplied as `RAILWAY_API_TOKEN` and use the Bearer authorization header.
-
-### Fallback mode
-
-If no Railway API token is configured, the project keeps a compatibility fallback:
-
-- Vision uses `VISION_PUBLIC_*` or Railway's automatic `RAILWAY_TCP_PROXY_*` variables.
-- XHTTP REALITY uses `XHTTP_REALITY_PUBLIC_*`.
-- gRPC REALITY uses `GRPC_REALITY_PUBLIC_*`.
-
-For fully automatic endpoint tracking, configure `RAILWAY_PROJECT_TOKEN`.
-
-## Four nodes
-
-The container generates exactly four VLESS links:
-
-- VLESS + RAW/TCP + REALITY + Vision
-- VLESS + XHTTP + REALITY
-- VLESS + XHTTP + TLS
-- VLESS + gRPC + REALITY
-
-The persistent volume keeps UUID, REALITY keypair, short ID, and subscription token. Public TCP endpoint host/port values are deliberately **not** restored from persistent state.
-
-## Stale-state protection
-
-The build rejects the previously observed stale endpoint:
-
-```text
-altaria.proxy.rlwy.net:32227
-```
-
-A deployment is not considered correct unless its logs contain:
-
-```text
-BUILD=v54-four-node-physical-isolation
-TOPOLOGY=8080/http-gateway 8081/vision 8082/xhttp-reality 8083/grpc-reality 10086/xhttp-tls
-READY: build=v54-four-node-physical-isolation http=8080 vision=8081 xhttp-reality=8082 grpc-reality=8083 xhttp-tls=10086
+BUILD=fixed-8-node-baseline
+TCP_PROXY=<current-railway-tcp-domain>:<current-port> -> gateway:8080
+REALITY=127.0.0.1:10087 SNI_COUNT=7
+XHTTP_TLS=<railway-domain>:443 -> 127.0.0.1:10086
+NODES=8 (1 HTTPS XHTTP + 7 REALITY Vision SNI)
+READY: build=fixed-8-node-baseline gateway=8080 xray_reality=10087 xray_xhttp=10086 ...
 ```
 
 ## Subscription
@@ -129,8 +101,15 @@ After deployment:
 https://<your-railway-domain>/sub/<generated-token>
 ```
 
-The subscription response is Base64 encoded and contains four VLESS links.
+The response is Base64 encoded and contains exactly eight VLESS links.
 
 ## Xray
 
-The project uses one Xray core. No second proxy core is required.
+One Xray core is used. The private listeners are:
+
+```text
+10086 → VLESS + XHTTP (Railway HTTPS already terminated)
+10087 → VLESS + TCP + REALITY + Vision (seven SNI profiles)
+```
+
+The next three experimental protocols are intentionally **not included** in this baseline. They should only be tested after this eight-node baseline is confirmed stable.

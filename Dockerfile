@@ -11,7 +11,7 @@ COPY scripts/ /opt/xray/scripts/
 COPY config/ /opt/xray/config/
 COPY site/ /opt/xray/site/
 RUN chmod 0755 /usr/local/bin/xray /opt/xray/scripts/*.sh /opt/xray/scripts/*.py && chmod 0644 /opt/xray/config/* /opt/xray/site/*
-ENV BUILD_ID=fixed-4-node-physical-isolation-v1 \
+ENV BUILD_ID=fixed-4-node-physical-isolation-v2 \
     PORT=8080 \
     GATEWAY_PORTS=8080,8081,8082,8083 \
     XRAY_HTTP_PORT=10086 \

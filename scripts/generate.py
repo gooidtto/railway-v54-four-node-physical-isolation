@@ -11,6 +11,8 @@ D = Path(os.environ.get("DATA_DIR", "/data")); D.mkdir(parents=True, exist_ok=Tr
 C = Path(os.environ.get("XRAY_CONFIG", "/etc/xray/config.json"))
 UUID = os.environ["UUID"].strip(); PRIVATE_KEY = os.environ["PRIVATE_KEY"].strip(); PUBLIC_KEY = os.environ["PUBLIC_KEY"].strip(); PUBLIC_DOMAIN = os.environ["PUBLIC_DOMAIN"].strip()
 
+# This release is intentionally and permanently four-node.
+NODE_COUNT = 4
 
 def proxy(prefix, dh, dp, da):
     h = os.environ.get(prefix + "_DOMAIN", dh).strip(); p = os.environ.get(prefix + "_PORT", dp).strip(); a = os.environ.get(prefix + "_APPLICATION_PORT", da).strip()
@@ -47,54 +49,38 @@ while len(ids) < 2: ids.append(secrets.token_hex(6))
 ids = ids[:2]
 ids_file.write_text(json.dumps(ids, indent=2) + "\n"); short_file.write_text(ids[0] + "\n")
 
-reality_raw = {
-    "tag": "vless-reality-vision", "listen": "127.0.0.1", "port": 10087, "protocol": "vless",
-    "settings": {"clients": [{"id": UUID, "level": 0, "flow": "xtls-rprx-vision"}], "decryption": "none"},
-    "streamSettings": {"network": "tcp", "security": "reality", "realitySettings": {"show": False, "target": REALITY_TARGET, "serverNames": [REALITY_SNI], "privateKey": PRIVATE_KEY, "shortIds": [ids[0]]}}
-}
-reality_grpc = {
-    "tag": "vless-reality-grpc", "listen": "127.0.0.1", "port": 10088, "protocol": "vless",
-    "settings": {"clients": [{"id": UUID, "level": 0}], "decryption": "none"},
-    "streamSettings": {"network": "grpc", "security": "reality", "realitySettings": {"show": False, "target": REALITY_TARGET, "serverNames": [REALITY_SNI], "privateKey": PRIVATE_KEY, "shortIds": [ids[1]]}, "grpcSettings": {"serviceName": GRPC_SERVICE, "multiMode": False}}
-}
-xhttp = {
-    "tag": "vless-xhttp-tls", "listen": "127.0.0.1", "port": 10086, "protocol": "vless",
-    "settings": {"clients": [{"id": UUID, "level": 0}], "decryption": "none"},
-    "streamSettings": {"network": "xhttp", "security": "none", "xhttpSettings": {"path": XPATH, "mode": "auto"}}
-}
-ws_tls = {
-    "tag": "vless-ws-tls", "listen": "127.0.0.1", "port": 10089, "protocol": "vless",
-    "settings": {"clients": [{"id": UUID, "level": 0}], "decryption": "none"},
-    "streamSettings": {"network": "ws", "security": "tls", "tlsSettings": {"alpn": ["http/1.1"], "certificates": [{"certificateFile": str(WS_CERT), "keyFile": str(WS_KEY)}]}, "wsSettings": {"path": WS_PATH, "headers": {"Host": WS_HOST}}}
-}
+reality_raw = {"tag":"vless-reality-vision","listen":"127.0.0.1","port":10087,"protocol":"vless","settings":{"clients":[{"id":UUID,"level":0,"flow":"xtls-rprx-vision"}],"decryption":"none"},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"show":False,"target":REALITY_TARGET,"serverNames":[REALITY_SNI],"privateKey":PRIVATE_KEY,"shortIds":[ids[0]]}}}
+reality_grpc = {"tag":"vless-reality-grpc","listen":"127.0.0.1","port":10088,"protocol":"vless","settings":{"clients":[{"id":UUID,"level":0}],"decryption":"none"},"streamSettings":{"network":"grpc","security":"reality","realitySettings":{"show":False,"target":REALITY_TARGET,"serverNames":[REALITY_SNI],"privateKey":PRIVATE_KEY,"shortIds":[ids[1]]},"grpcSettings":{"serviceName":GRPC_SERVICE,"multiMode":False}}}
+xhttp = {"tag":"vless-xhttp-tls","listen":"127.0.0.1","port":10086,"protocol":"vless","settings":{"clients":[{"id":UUID,"level":0}],"decryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"path":XPATH,"mode":"auto"}}}
+ws_tls = {"tag":"vless-ws-tls","listen":"127.0.0.1","port":10089,"protocol":"vless","settings":{"clients":[{"id":UUID,"level":0}],"decryption":"none"},"streamSettings":{"network":"ws","security":"tls","tlsSettings":{"alpn":["http/1.1"],"certificates":[{"certificateFile":str(WS_CERT),"keyFile":str(WS_KEY)}]},"wsSettings":{"path":WS_PATH,"headers":{"Host":WS_HOST}}}
 
-cfg = {"log": {"loglevel": os.environ.get("XRAY_LOGLEVEL", "warning")}, "policy": {"levels": {"0": {"handshake": 8, "connIdle": 900, "uplinkOnly": 2, "downlinkOnly": 5}}}, "inbounds": [reality_raw, reality_grpc, xhttp, ws_tls], "outbounds": [{"tag": "direct", "protocol": "freedom"}, {"tag": "block", "protocol": "blackhole"}]}
-C.write_text(json.dumps(cfg, indent=2) + "\n")
+cfg={"log":{"loglevel":os.environ.get("XRAY_LOGLEVEL","warning")},"policy":{"levels":{"0":{"handshake":8,"connIdle":900,"uplinkOnly":2,"downlinkOnly":5}}},"inbounds":[reality_raw,reality_grpc,xhttp,ws_tls],"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}]}
+C.write_text(json.dumps(cfg,indent=2)+"\n")
 
+def q(params): return urllib.parse.urlencode({k:str(v) for k,v in params.items() if v not in (None,"")},safe="")
+def link(host,port,params,name): return f"vless://{UUID}@{host}:{port}?{q(params)}#{urllib.parse.quote(name,safe='')}"
 
-def q(params): return urllib.parse.urlencode({k: str(v) for k, v in params.items() if v not in (None, "")}, safe="")
-def link(host, port, params, name): return f"vless://{UUID}@{host}:{port}?{q(params)}#{urllib.parse.quote(name, safe='')}"
-
-lines = [
-    link(PUBLIC_DOMAIN, 443, {"encryption":"none","security":"tls","sni":PUBLIC_DOMAIN,"fp":FP,"alpn":"h2,http/1.1","type":"xhttp","path":XPATH,"mode":"auto"}, "VLESS XHTTP TLS · Railway Domain"),
-    link(p1["domain"], p1["port"], {"encryption":"none","flow":"xtls-rprx-vision","security":"reality","sni":REALITY_SNI,"fp":FP,"pbk":PUBLIC_KEY,"sid":ids[0],"type":"tcp"}, f"VLESS RAW REALITY Vision · TCP {p1['application_port']}"),
-    link(p2["domain"], p2["port"], {"encryption":"none","security":"reality","sni":REALITY_SNI,"fp":FP,"pbk":PUBLIC_KEY,"sid":ids[1],"type":"grpc","serviceName":GRPC_SERVICE,"mode":"gun"}, f"VLESS gRPC REALITY · TCP {p2['application_port']}"),
-    link(p3["domain"], p3["port"], {"encryption":"none","security":"tls","sni":WS_HOST,"fp":FP,"alpn":"http/1.1","type":"ws","host":WS_HOST,"path":WS_PATH,"allowInsecure":"1"}, f"VLESS WS TLS · TCP {p3['application_port']}"),
+lines=[
+ link(PUBLIC_DOMAIN,443,{"encryption":"none","security":"tls","sni":PUBLIC_DOMAIN,"fp":FP,"alpn":"h2,http/1.1","type":"xhttp","path":XPATH,"mode":"auto"},"VLESS XHTTP TLS · Railway Domain"),
+ link(p1["domain"],p1["port"],{"encryption":"none","flow":"xtls-rprx-vision","security":"reality","sni":REALITY_SNI,"fp":FP,"pbk":PUBLIC_KEY,"sid":ids[0],"type":"tcp"},f"VLESS RAW REALITY Vision · TCP {p1['application_port']}"),
+ link(p2["domain"],p2["port"],{"encryption":"none","security":"reality","sni":REALITY_SNI,"fp":FP,"pbk":PUBLIC_KEY,"sid":ids[1],"type":"grpc","serviceName":GRPC_SERVICE,"mode":"gun"},f"VLESS gRPC REALITY · TCP {p2['application_port']}"),
+ link(p3["domain"],p3["port"],{"encryption":"none","security":"tls","sni":WS_HOST,"fp":FP,"alpn":"http/1.1","type":"ws","host":WS_HOST,"path":WS_PATH,"allowInsecure":"1"},f"VLESS WS TLS · TCP {p3['application_port']}"),
 ]
-if len(lines) != 4: raise SystemExit("expected exactly 4 nodes")
+if len(lines) != NODE_COUNT: raise SystemExit(f"subscription invariant failed: expected {NODE_COUNT}, got {len(lines)}")
 
-for i, line in enumerate(lines, 1):
-    u = urllib.parse.urlsplit(line)
-    if u.scheme != "vless" or not u.hostname or not u.port: raise SystemExit(f"node {i}: invalid URI")
+for i,line in enumerate(lines,1):
+    u=urllib.parse.urlsplit(line)
+    if u.scheme!="vless" or not u.hostname or not u.port: raise SystemExit(f"node {i}: invalid URI")
 
-state = {"schema":7,"build":"fixed-4-node-physical-isolation","public_domain":PUBLIC_DOMAIN,"tcp_proxies":[p1,p2,p3],"gateway_ports":[8080,8081,8082,8083],"xray_inbounds":{"xhttp_tls":10086,"reality_raw":10087,"reality_grpc":10088,"ws_tls":10089},"reality":{"target":REALITY_TARGET,"sni":REALITY_SNI,"short_ids":ids},"ws":{"host":WS_HOST,"path":WS_PATH},"grpc":{"service_name":GRPC_SERVICE}}
-fingerprint = hashlib.sha256(json.dumps(state, sort_keys=True, separators=(",",":")).encode()).hexdigest(); state["fingerprint"] = fingerprint
-(D/"state.json").write_text(json.dumps(state, indent=2)+"\n")
-(D/"subscription.txt.tmp").write_text("\n".join(lines)+"\n"); os.replace(D/"subscription.txt.tmp", D/"subscription.txt")
-(D/"manifest.json").write_text(json.dumps({"schema":7,"build":"fixed-4-node-physical-isolation","node_count":4,"distribution":{"443":"xhttp-tls","23337":"raw-reality-vision","23389":"grpc-reality","17903":"ws-tls"},"state_fingerprint":fingerprint}, indent=2)+"\n")
-print("BUILD=fixed-4-node-physical-isolation", flush=True)
-print(f"XHTTP_TLS={PUBLIC_DOMAIN}:443 -> 8080 -> 10086", flush=True)
-print(f"RAW_REALITY={p1['domain']}:{p1['port']} -> 8081 -> 10087", flush=True)
-print(f"GRPC_REALITY={p2['domain']}:{p2['port']} -> 8082 -> 10088", flush=True)
-print(f"WS_TLS={p3['domain']}:{p3['port']} -> 8083 -> 10089", flush=True)
-print("SUBSCRIPTION_NODES=4", flush=True)
+state={"schema":8,"build":"fixed-4-node-physical-isolation-v2","node_count":NODE_COUNT,"public_domain":PUBLIC_DOMAIN,"tcp_proxies":[p1,p2,p3],"gateway_ports":[8080,8081,8082,8083],"xray_inbounds":{"xhttp_tls":10086,"reality_raw":10087,"reality_grpc":10088,"ws_tls":10089},"reality":{"target":REALITY_TARGET,"sni":REALITY_SNI,"short_ids":ids},"ws":{"host":WS_HOST,"path":WS_PATH},"grpc":{"service_name":GRPC_SERVICE}}
+fingerprint=hashlib.sha256(json.dumps(state,sort_keys=True,separators=(",",":")).encode()).hexdigest();state["fingerprint"]=fingerprint
+(D/"state.json").write_text(json.dumps(state,indent=2)+"\n")
+(D/"subscription.txt.tmp").write_text("\n".join(lines)+"\n");os.replace(D/"subscription.txt.tmp",D/"subscription.txt")
+(D/"manifest.json").write_text(json.dumps({"schema":8,"build":"fixed-4-node-physical-isolation-v2","node_count":NODE_COUNT,"distribution":{"443":"xhttp-tls","23337":"raw-reality-vision","23389":"grpc-reality","17903":"ws-tls"},"state_fingerprint":fingerprint},indent=2)+"\n")
+print("BUILD=fixed-4-node-physical-isolation-v2",flush=True)
+print("SUBSCRIPTION_INVARIANT=4",flush=True)
+print(f"XHTTP_TLS={PUBLIC_DOMAIN}:443 -> 8080 -> 10086",flush=True)
+print(f"RAW_REALITY={p1['domain']}:{p1['port']} -> 8081 -> 10087",flush=True)
+print(f"GRPC_REALITY={p2['domain']}:{p2['port']} -> 8082 -> 10088",flush=True)
+print(f"WS_TLS={p3['domain']}:{p3['port']} -> 8083 -> 10089",flush=True)
+print("SUBSCRIPTION_NODES=4",flush=True)

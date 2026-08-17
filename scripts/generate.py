@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-import hashlib, json, os, re, secrets, urllib.parse
+import base64
+import hashlib
+import json
+import os
+import re
+import secrets
+import urllib.parse
 from pathlib import Path
 
 D = Path(os.environ.get("DATA_DIR", "/data"))
@@ -11,43 +17,28 @@ PRIVATE_KEY = os.environ["PRIVATE_KEY"]
 PUBLIC_KEY = os.environ["PUBLIC_KEY"]
 PUBLIC_DOMAIN = os.environ["PUBLIC_DOMAIN"]
 
-VISION_HOST = os.environ["VISION_PUBLIC_HOST"]
-VISION_PORT = int(os.environ["VISION_PUBLIC_PORT"])
-XREAL_HOST = os.environ["XHTTP_REALITY_PUBLIC_HOST"]
-XREAL_PORT = int(os.environ["XHTTP_REALITY_PUBLIC_PORT"])
-GRPC_HOST = os.environ["GRPC_REALITY_PUBLIC_HOST"]
-GRPC_PORT = int(os.environ["GRPC_REALITY_PUBLIC_PORT"])
+TCP_HOST = os.environ.get("RAILWAY_TCP_PROXY_DOMAIN", "").strip()
+TCP_PORT_RAW = os.environ.get("RAILWAY_TCP_PROXY_PORT", "").strip()
+if not TCP_HOST or not TCP_PORT_RAW:
+    raise SystemExit("missing RAILWAY_TCP_PROXY_DOMAIN/PORT")
+try:
+    TCP_PORT = int(TCP_PORT_RAW)
+except ValueError:
+    raise SystemExit("invalid RAILWAY_TCP_PROXY_PORT")
+if not 1 <= TCP_PORT <= 65535:
+    raise SystemExit("invalid RAILWAY_TCP_PROXY_PORT")
 
-VISION = int(os.environ.get("XRAY_VISION_PORT", "8081"))
-XREAL = int(os.environ.get("XRAY_XHTTP_REALITY_PORT", "8082"))
-GRPC = int(os.environ.get("XRAY_GRPC_REALITY_PORT", "8083"))
-HTTP = int(os.environ.get("XRAY_HTTP_PORT", "10086"))
-
-if (VISION, XREAL, GRPC, HTTP) != (8081, 8082, 8083, 10086):
-    raise SystemExit("internal topology must be 8081/8082/8083/10086")
-
-for label, host, port in (
-    ("VISION", VISION_HOST, VISION_PORT),
-    ("XHTTP_REALITY", XREAL_HOST, XREAL_PORT),
-    ("GRPC_REALITY", GRPC_HOST, GRPC_PORT),
-):
-    if not host or not 1 <= port <= 65535:
-        raise SystemExit(f"invalid {label} public endpoint")
-
-# Railway TCP Proxy endpoints are runtime configuration.
-# Never restore host/port from persisted state.
-stale = ("altaria.proxy.rlwy.net", 32227)
-for host, port in ((VISION_HOST, VISION_PORT), (XREAL_HOST, XREAL_PORT), (GRPC_HOST, GRPC_PORT)):
-    if (host, port) == stale:
-        raise SystemExit("refusing stale endpoint altaria.proxy.rlwy.net:32227")
+HTTP_PORT = 10086
+REALITY_PORT = 10087
+GATEWAY_PORT = 8080
 
 sni_file = Path(os.environ.get(
     "REALITY_SNI_CANDIDATES_FILE",
     "/opt/xray/config/reality-sni-candidates.txt"
 ))
 snis = [x.strip() for x in sni_file.read_text().splitlines() if x.strip()]
-if len(snis) < 3:
-    raise SystemExit("need at least three REALITY SNI candidates")
+if len(snis) != 7:
+    raise SystemExit(f"fixed baseline requires exactly 7 REALITY SNI entries, got {len(snis)}")
 
 short_file = D / "short_id.txt"
 short_id = short_file.read_text().strip() if short_file.exists() else secrets.token_hex(6)
@@ -58,53 +49,52 @@ target = os.environ.get("REALITY_TARGET", "www.cloudflare.com:443")
 fp = os.environ.get("REALITY_FINGERPRINT", "chrome")
 xpath = os.environ.get("XHTTP_PATH", "/xhttp")
 xmode = os.environ.get("XHTTP_MODE", "auto")
-grpc_name = os.environ.get("GRPC_SERVICE_NAME", "grpc-service")
 
-def inbound(port, sni, network, flow=None):
-    client = {"id": UUID, "level": 0}
-    if flow:
-        client["flow"] = flow
-    stream = {
-        "network": network,
+# One REALITY inbound serves seven SNI profiles. The external TCP Proxy is
+# intentionally a single endpoint and the gateway transparently forwards TLS
+# ClientHello traffic to 10087. The Railway Generate Domain HTTP path is
+# forwarded to the private XHTTP listener at 10086.
+reality = {
+    "tag": "vless-reality-7-sni",
+    "listen": "127.0.0.1",
+    "port": REALITY_PORT,
+    "protocol": "vless",
+    "settings": {
+        "clients": [{
+            "id": UUID,
+            "level": 0,
+            "flow": "xtls-rprx-vision"
+        }],
+        "decryption": "none"
+    },
+    "streamSettings": {
+        "network": "tcp",
         "security": "reality",
         "realitySettings": {
             "show": False,
             "target": target,
-            "serverNames": [sni],
+            "serverNames": snis,
             "privateKey": PRIVATE_KEY,
             "shortIds": [short_id]
         }
     }
-    if network == "xhttp":
-        stream["xhttpSettings"] = {"path": xpath, "mode": xmode}
-    elif network == "grpc":
-        stream["grpcSettings"] = {"serviceName": grpc_name}
-    return {
-        "tag": f"vless-{network}-{port}",
-        "listen": "0.0.0.0",
-        "port": port,
-        "protocol": "vless",
-        "settings": {"clients": [client], "decryption": "none"},
-        "streamSettings": stream
-    }
+}
 
-inbounds = [
-    inbound(VISION, snis[0], "raw", "xtls-rprx-vision"),
-    inbound(XREAL, snis[1], "xhttp"),
-    inbound(GRPC, snis[2], "grpc"),
-    {
-        "tag": "xhttp-tls",
-        "listen": "127.0.0.1",
-        "port": HTTP,
-        "protocol": "vless",
-        "settings": {"clients": [{"id": UUID, "level": 0}], "decryption": "none"},
-        "streamSettings": {
-            "network": "xhttp",
-            "security": "none",
-            "xhttpSettings": {"path": xpath, "mode": xmode}
-        }
+xhttp_tls = {
+    "tag": "vless-xhttp-tls",
+    "listen": "127.0.0.1",
+    "port": HTTP_PORT,
+    "protocol": "vless",
+    "settings": {
+        "clients": [{"id": UUID, "level": 0}],
+        "decryption": "none"
+    },
+    "streamSettings": {
+        "network": "xhttp",
+        "security": "none",
+        "xhttpSettings": {"path": xpath, "mode": xmode}
     }
-]
+}
 
 cfg = {
     "log": {"loglevel": os.environ.get("XRAY_LOGLEVEL", "warning")},
@@ -114,7 +104,7 @@ cfg = {
         "uplinkOnly": 2,
         "downlinkOnly": 5
     }}},
-    "inbounds": inbounds,
+    "inbounds": [reality, xhttp_tls],
     "outbounds": [
         {"tag": "direct", "protocol": "freedom"},
         {"tag": "block", "protocol": "blackhole"}
@@ -123,17 +113,17 @@ cfg = {
 C.write_text(json.dumps(cfg, indent=2) + "\n")
 
 state = {
-    "schema": 1,
-    "build": "v54-four-node-physical-isolation",
-    "mode": "physical-isolation",
+    "schema": 2,
+    "build": "fixed-8-node-baseline",
+    "mode": "single-tcp-proxy-7-reality-plus-https-xhttp",
     "uuid": UUID,
     "public_key": PUBLIC_KEY,
     "short_id": short_id,
     "public_domain": PUBLIC_DOMAIN,
-    "vision": [VISION_HOST, VISION_PORT, VISION],
-    "xhttp_reality": [XREAL_HOST, XREAL_PORT, XREAL],
-    "xhttp_tls": [PUBLIC_DOMAIN, 443, HTTP],
-    "grpc_reality": [GRPC_HOST, GRPC_PORT, GRPC],
+    "tcp_proxy": [TCP_HOST, TCP_PORT],
+    "reality_listener": REALITY_PORT,
+    "xhttp_listener": HTTP_PORT,
+    "reality_sni": snis,
 }
 fingerprint = hashlib.sha256(
     json.dumps(state, sort_keys=True, separators=(",", ":")).encode()
@@ -149,29 +139,6 @@ def vless(host, port, params, name):
     )
 
 lines = [
-    vless(VISION_HOST, VISION_PORT, {
-        "encryption": "none",
-        "flow": "xtls-rprx-vision",
-        "security": "reality",
-        "sni": snis[0],
-        "fp": fp,
-        "pbk": PUBLIC_KEY,
-        "sid": short_id,
-        "type": "tcp"
-    }, "VLESS RAW REALITY Vision"),
-
-    vless(XREAL_HOST, XREAL_PORT, {
-        "encryption": "none",
-        "security": "reality",
-        "sni": snis[1],
-        "fp": fp,
-        "pbk": PUBLIC_KEY,
-        "sid": short_id,
-        "type": "xhttp",
-        "path": xpath,
-        "mode": xmode
-    }, "VLESS XHTTP REALITY"),
-
     vless(PUBLIC_DOMAIN, 443, {
         "encryption": "none",
         "security": "tls",
@@ -181,37 +148,38 @@ lines = [
         "path": xpath,
         "mode": xmode
     }, "VLESS XHTTP TLS"),
+]
 
-    vless(GRPC_HOST, GRPC_PORT, {
+for i, sni in enumerate(snis, 1):
+    lines.append(vless(TCP_HOST, TCP_PORT, {
         "encryption": "none",
+        "flow": "xtls-rprx-vision",
         "security": "reality",
-        "sni": snis[2],
+        "sni": sni,
         "fp": fp,
         "pbk": PUBLIC_KEY,
         "sid": short_id,
-        "type": "grpc",
-        "serviceName": grpc_name
-    }, "VLESS gRPC REALITY")
-]
+        "type": "tcp"
+    }, f"VLESS REALITY Vision {i:02d} · {sni}"))
+
 (D / "subscription.txt").write_text("\n".join(lines) + "\n")
 
 manifest = {
-    "schema": 1,
-    "build": "v54-four-node-physical-isolation",
-    "mode": "physical-isolation",
+    "schema": 2,
+    "build": "fixed-8-node-baseline",
+    "mode": "single-tcp-proxy-7-reality-plus-https-xhttp",
     "gateway": "0.0.0.0:8080",
+    "tcp_proxy": {"public": [TCP_HOST, TCP_PORT], "target": GATEWAY_PORT},
     "nodes": {
-        "vision": {"public": [VISION_HOST, VISION_PORT], "internal": ["127.0.0.1", VISION]},
-        "xhttp_reality": {"public": [XREAL_HOST, XREAL_PORT], "internal": ["127.0.0.1", XREAL]},
-        "xhttp_tls": {"public": [PUBLIC_DOMAIN, 443], "internal": ["127.0.0.1", HTTP]},
-        "grpc_reality": {"public": [GRPC_HOST, GRPC_PORT], "internal": ["127.0.0.1", GRPC]}
+        "https_xhttp": {"public": [PUBLIC_DOMAIN, 443], "internal": ["127.0.0.1", HTTP_PORT]},
+        "reality_7_sni": {"public": [TCP_HOST, TCP_PORT], "internal": ["127.0.0.1", REALITY_PORT], "sni": snis}
     },
     "state_fingerprint": fingerprint
 }
 (D / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
-print("BUILD=v54-four-node-physical-isolation", flush=True)
-print(f"VISION={VISION_HOST}:{VISION_PORT} -> 127.0.0.1:{VISION}", flush=True)
-print(f"XHTTP_REALITY={XREAL_HOST}:{XREAL_PORT} -> 127.0.0.1:{XREAL}", flush=True)
-print(f"XHTTP_TLS={PUBLIC_DOMAIN}:443 -> 127.0.0.1:{HTTP}", flush=True)
-print(f"GRPC_REALITY={GRPC_HOST}:{GRPC_PORT} -> 127.0.0.1:{GRPC}", flush=True)
+print("BUILD=fixed-8-node-baseline", flush=True)
+print(f"TCP_PROXY={TCP_HOST}:{TCP_PORT} -> gateway:{GATEWAY_PORT}", flush=True)
+print(f"REALITY=127.0.0.1:{REALITY_PORT} SNI_COUNT=7", flush=True)
+print(f"XHTTP_TLS={PUBLIC_DOMAIN}:443 -> 127.0.0.1:{HTTP_PORT}", flush=True)
+print("NODES=8 (1 HTTPS XHTTP + 7 REALITY Vision SNI)", flush=True)

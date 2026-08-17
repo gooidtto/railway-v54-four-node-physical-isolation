@@ -35,8 +35,6 @@ RAW_TARGET = os.environ.get("REALITY_RAW_TARGET", "www.cloudflare.com:443").stri
 XHTTP_TARGET = os.environ.get("REALITY_XHTTP_TARGET", "www.apple.com:443").strip() or "www.apple.com:443"
 XPATH = os.environ.get("XHTTP_PATH", "/xhttp").strip() or "/xhttp"
 
-# Cloudflare variables are read once here.  runtime.json is the frozen
-# single source of truth consumed by start.sh and all diagnostics.
 def env_first(*names):
     for name in names:
         value = (os.environ.get(name) or "").strip()
@@ -46,16 +44,17 @@ def env_first(*names):
 
 CF_TOKEN = env_first("CLOUDFLARE_TUNNEL_TOKEN", "CF_TUNNEL_TOKEN", "TUNNEL_TOKEN")
 CF_HOST = env_first("CLOUDFLARE_PUBLIC_HOSTNAME", "CF_PUBLIC_HOSTNAME").lower()
-CF_ORIGIN = env_first("CLOUDFLARE_ORIGIN_SERVICE", "CF_ORIGIN_SERVICE")
+CF_ORIGIN_RAW = env_first("CLOUDFLARE_ORIGIN_SERVICE", "CF_ORIGIN_SERVICE")
 CF_PORT_RAW = env_first("WS_PORT", "CLOUDFLARE_WS_PORT", "CF_WS_PORT")
 CF_PATH = env_first("WS_PATH", "CLOUDFLARE_WS_PATH", "CF_WS_PATH")
 CF_ID = env_first("CLOUDFLARE_TUNNEL_ID", "CF_TUNNEL_ID", "TUNNEL_ID")
 
-# Four-node mode is enabled only when the complete runtime contract exists.
-# Tunnel ID is metadata only; the tunnel token is the runtime credential.
-CF_ENABLED = bool(CF_TOKEN and CF_HOST and CF_ORIGIN and CF_PORT_RAW and CF_PATH)
+# WS_PORT is authoritative. ORIGIN_SERVICE is normalized to the local WS port
+# so a stale/misformatted Railway variable cannot silently disable node 4.
+CF_ENABLED = bool(CF_TOKEN and CF_HOST and CF_PORT_RAW and CF_PATH)
 CF_PORT = None
 CF_INVALID_REASON = ""
+CF_ORIGIN = ""
 
 if CF_ENABLED:
     try:
@@ -66,18 +65,20 @@ if CF_ENABLED:
     if CF_ENABLED and not 1 <= CF_PORT <= 65535:
         CF_ENABLED = False
         CF_INVALID_REASON = "WS_PORT outside 1-65535"
+    if CF_ENABLED and CF_PORT == APP_PORT:
+        CF_ENABLED = False
+        CF_INVALID_REASON = "WS_PORT must differ from GATEWAY_PORT 8080"
+    if CF_ENABLED and CF_PORT in (10086, 10087, 10088):
+        CF_ENABLED = False
+        CF_INVALID_REASON = "WS_PORT conflicts with an existing Xray inbound port"
     if CF_ENABLED and not re.fullmatch(r"[A-Za-z0-9.-]+", CF_HOST):
         CF_ENABLED = False
         CF_INVALID_REASON = "CLOUDFLARE_PUBLIC_HOSTNAME invalid"
     if CF_ENABLED and not CF_PATH.startswith("/"):
         CF_ENABLED = False
         CF_INVALID_REASON = "WS_PATH must start with /"
-    if CF_ENABLED and not re.fullmatch(r"http://127\.0\.0\.1:\d+", CF_ORIGIN):
-        CF_ENABLED = False
-        CF_INVALID_REASON = "CLOUDFLARE_ORIGIN_SERVICE must be http://127.0.0.1:<WS_PORT>"
-
-if CF_ENABLED and CF_ORIGIN != f"http://127.0.0.1:{CF_PORT}":
-    raise SystemExit(f"FATAL: CLOUDFLARE_ORIGIN_SERVICE must equal http://127.0.0.1:{CF_PORT}")
+    if CF_ENABLED:
+        CF_ORIGIN = f"http://127.0.0.1:{CF_PORT}"
 
 ids_file = D / "reality_short_ids.json"
 try:
@@ -89,7 +90,6 @@ while len(ids) < 2:
     ids.append(secrets.token_hex(6))
 ids = ids[:2]
 ids_file.write_text(json.dumps(ids, indent=2) + "\n")
-
 
 def reality(tag, port, network, sni, target, sid, flow=""):
     client = {"id": UUID, "level": 0}
@@ -116,7 +116,6 @@ def reality(tag, port, network, sni, target, sid, flow=""):
         "settings": {"clients": [client], "decryption": "none"},
         "streamSettings": ss,
     }
-
 
 xhttp_tls = {
     "tag": "vless-xhttp-tls",
@@ -157,10 +156,8 @@ config = {
 }
 C.write_text(json.dumps(config, indent=2) + "\n")
 
-
 def q(d):
     return urllib.parse.urlencode({k: str(v) for k, v in d.items() if v not in (None, "")}, safe="")
-
 
 def link(host, port, params, name):
     return f'vless://{UUID}@{host}:{port}?{q(params)}#{urllib.parse.quote(name, safe="")}'
@@ -192,8 +189,8 @@ if NODE_COUNT not in (3, 4):
     raise SystemExit(f"FATAL: invalid node count: {NODE_COUNT}")
 
 runtime = {
-    "schema": 21,
-    "build": "stable-optional-cloudflare-ws-v2",
+    "schema": 22,
+    "build": "stable-optional-cloudflare-ws-v3",
     "architecture": "single-8080-router-plus-optional-cloudflare-tunnel",
     "cloudflare": {
         "enabled": CF_ENABLED,
@@ -201,6 +198,7 @@ runtime = {
         "tunnel_id_configured": bool(CF_ID),
         "public_hostname": CF_HOST if CF_ENABLED else "",
         "origin_service": CF_ORIGIN if CF_ENABLED else "",
+        "origin_service_input_present": bool(CF_ORIGIN_RAW),
         "ws_port": CF_PORT if CF_ENABLED else None,
         "ws_path": CF_PATH if CF_ENABLED else "",
         "validation_error": CF_INVALID_REASON,
@@ -232,8 +230,8 @@ runtime["fingerprint"] = hashlib.sha256(json.dumps(runtime, sort_keys=True, sepa
 os.replace(D / "subscription.txt.tmp", D / "subscription.txt")
 
 manifest = {
-    "schema": 21,
-    "build": "stable-optional-cloudflare-ws-v2",
+    "schema": 22,
+    "build": "stable-optional-cloudflare-ws-v3",
     "node_count": NODE_COUNT,
     "application_port": APP_PORT,
     "cloudflare_ws_enabled": CF_ENABLED,
@@ -242,18 +240,20 @@ manifest = {
 }
 (D / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
-print("RELEASE=stable-optional-cloudflare-ws-v2", flush=True)
+print("RELEASE=stable-optional-cloudflare-ws-v3", flush=True)
 print("RUNTIME_STATE=/data/runtime.json", flush=True)
 print(f"RUNTIME_FINGERPRINT={runtime['fingerprint']}", flush=True)
 print(f"CLOUDFLARE_WS={'enabled' if CF_ENABLED else 'disabled'}", flush=True)
 print(f"CF_ENV_TOKEN={'present' if CF_TOKEN else 'missing'}", flush=True)
 print(f"CF_ENV_HOST={'present' if CF_HOST else 'missing'}", flush=True)
-print(f"CF_ENV_ORIGIN={'present' if CF_ORIGIN else 'missing'}", flush=True)
+print(f"CF_ENV_ORIGIN={'present' if CF_ORIGIN_RAW else 'missing'}", flush=True)
 print(f"CF_ENV_PORT={'present' if CF_PORT_RAW else 'missing'}", flush=True)
 print(f"CF_ENV_PATH={'present' if CF_PATH else 'missing'}", flush=True)
 print(f"CF_ENV_TUNNEL_ID={'present' if CF_ID else 'missing'}", flush=True)
 if CF_INVALID_REASON:
     print(f"CLOUDFLARE_VALIDATION={CF_INVALID_REASON}", flush=True)
+if CF_ENABLED:
+    print(f"CLOUDFLARE_ORIGIN_NORMALIZED={CF_ORIGIN}", flush=True)
 print(f"SUBSCRIPTION_INVARIANT={NODE_COUNT}", flush=True)
 print(f"DOMAIN {PUBLIC_DOMAIN}:443 -> 8080 -> 10086 XHTTP TLS", flush=True)
 print(f"TCP {TCP_HOST}:{TCP_PORT} -> 8080 -> {RAW_SNI} -> 10087 RAW REALITY Vision", flush=True)

@@ -2,16 +2,25 @@
 import asyncio,base64,os,re,struct,urllib.parse
 from pathlib import Path
 
+# STABLE 3-NODE / SINGLE-8080 ROUTER
+# HTTP -> 10086 XHTTP (TLS terminated by Railway Domain)
+# SNI RAW1 -> 10087 REALITY Vision
+# SNI XHTTP -> 10088 XHTTP REALITY
+# SNI RAW2 -> 10089 REALITY Vision
 PORT=int(os.environ.get('GATEWAY_PORT','8080'));D=Path(os.environ.get('DATA_DIR','/data'));SITE=Path('/opt/xray/site/index.html')
-TOKEN=D/'subscription_token.txt';SUB=D/'subscription.txt';HTTP_DEST=('127.0.0.1',10086);REALITY_DEST=('127.0.0.1',10087)
-SNI=os.environ.get('REALITY_RAW_SNI','www.cloudflare.com').strip() or 'www.cloudflare.com'
+TOKEN=D/'subscription_token.txt';SUB=D/'subscription.txt';HTTP_DEST=('127.0.0.1',10086)
+ROUTES={
+ os.environ.get('REALITY_RAW_SNI','www.cloudflare.com').strip() or 'www.cloudflare.com':('127.0.0.1',10087,'raw-reality-vision-01'),
+ os.environ.get('REALITY_XHTTP_SNI','www.apple.com').strip() or 'www.apple.com':('127.0.0.1',10088,'xhttp-reality'),
+ os.environ.get('REALITY_RAW2_SNI','www.bing.com').strip() or 'www.bing.com':('127.0.0.1',10089,'raw-reality-vision-02'),
+}
 SEM=asyncio.Semaphore(int(os.environ.get('GATEWAY_MAX_CONNECTIONS','512')));TIMEOUT=float(os.environ.get('GATEWAY_READ_TIMEOUT','15'));MAX_INITIAL=65536
 HTTP=(b'GET ',b'POST ',b'HEAD ',b'PUT ',b'OPTIONS ',b'PATCH ',b'DELETE ',b'PRI * HTTP/2.0')
 
 def subscription(token):
     if not TOKEN.exists() or token!=TOKEN.read_text().strip():return None,'TOKEN_INVALID'
     lines=[x.strip() for x in SUB.read_text().splitlines() if x.strip()]
-    if len(lines)!=2 or any(not x.startswith('vless://') for x in lines):return None,'SUB_INVALID'
+    if len(lines)!=3 or any(not x.startswith('vless://') for x in lines):return None,'SUB_INVALID'
     return base64.b64encode('\n'.join(lines).encode()),'OK'
 
 def tls_sni(buf):
@@ -69,10 +78,10 @@ async def pipe(r,w):
             w.write(b);await w.drain()
     except (ConnectionError,asyncio.CancelledError):pass
 
-async def relay(reader,writer,initial,dest,label):
+async def relay(reader,writer,initial,dest,label,sni='-'):
     up=None;tasks=set()
     try:
-        ur,up=await asyncio.open_connection(*dest);up.write(initial);await up.drain();print(f'[gateway] ROUTE={label} sni={tls_sni(initial) or "-"}',flush=True)
+        ur,up=await asyncio.open_connection(*dest);up.write(initial);await up.drain();print(f'[gateway] ROUTE={label} sni={sni}',flush=True)
         tasks={asyncio.create_task(pipe(reader,up)),asyncio.create_task(pipe(ur,writer))};done,pending=await asyncio.wait(tasks,return_when=asyncio.FIRST_COMPLETED)
         for t in done:
             try:t.result()
@@ -103,7 +112,7 @@ async def http(reader,writer,initial):
         writer.write(resp);await writer.drain();return
     if method in ('GET','HEAD') and path in ('/','/index.html'):
         body=SITE.read_bytes();out=b'' if method=='HEAD' else body;writer.write(b'HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: '+str(len(body)).encode()+b'\r\nConnection: close\r\n\r\n'+out);await writer.drain();return
-    await relay(reader,writer,initial,HTTP_DEST,'http-xhttp')
+    await relay(reader,writer,initial,HTTP_DEST,'http-xhttp','-')
 
 async def handle(reader,writer):
     async with SEM:
@@ -112,7 +121,9 @@ async def handle(reader,writer):
             if not initial:return
             if initial.startswith(HTTP):await http(reader,writer,initial);return
             sni=tls_sni(initial)
-            if sni==SNI:await relay(reader,writer,initial,REALITY_DEST,'xhttp-reality');return
+            route=ROUTES.get(sni)
+            if route:
+                dest_port=route[1];await relay(reader,writer,initial,(route[0],dest_port),route[2],sni);return
             print(f'[gateway] ROUTE_REJECT unknown_sni={sni or "-"}',flush=True)
         except Exception as e:print(f'[gateway] ERROR={type(e).__name__}:{e}',flush=True)
         finally:
@@ -120,7 +131,7 @@ async def handle(reader,writer):
             except Exception:pass
 
 async def main():
-    server=await asyncio.start_server(handle,'0.0.0.0',PORT,limit=65536);print(f'GATEWAY_READY={PORT}',flush=True);print(f'ROUTES=http->{HTTP_DEST[1]};sni:{SNI}->{REALITY_DEST[1]}',flush=True)
+    server=await asyncio.start_server(handle,'0.0.0.0',PORT,limit=65536);print(f'GATEWAY_READY={PORT}',flush=True);print('[gateway] ROUTES='+','.join(f'{k}->{v[1]}' for k,v in ROUTES.items()),flush=True)
     try:await server.serve_forever()
     finally:server.close();await server.wait_closed()
 

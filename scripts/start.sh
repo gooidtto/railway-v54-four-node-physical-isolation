@@ -1,13 +1,17 @@
 #!/bin/sh
 set -eu
 umask 077
-BUILD_ID="fixed-4-node-physical-isolation-v5"
+BUILD_ID="fixed-4-node-physical-isolation-v6"
 D="${RAILWAY_VOLUME_MOUNT_PATH:-${DATA_DIR:-/data}}"; C="${XRAY_CONFIG:-/etc/xray/config.json}"; READY_FILE="${GATEWAY_READY_FILE:-$D/gateway.ready}"
 mkdir -p "$D" "$(dirname "$C")"; rm -f "$READY_FILE"
 write_secret(){ f="$1"; v="$2"; t="$f.tmp"; printf '%s\n' "$v">"$t"; chmod 600 "$t"; mv -f "$t" "$f"; }
 PUBLIC_DOMAIN="${RAILWAY_PUBLIC_DOMAIN:-}"; [ -n "$PUBLIC_DOMAIN" ] || { echo "FATAL: RAILWAY_PUBLIC_DOMAIN unavailable" >&2; exit 1; }
-TCP_HOST="${RAILWAY_TCP_PROXY_DOMAIN:-}"; TCP_PORT="${RAILWAY_TCP_PROXY_PORT:-}"; TCP_APP="${RAILWAY_TCP_APPLICATION_PORT:-}"; TCP2_HOST="${RAILWAY_TCP_PROXY_2_DOMAIN:-}"; TCP2_PORT="${RAILWAY_TCP_PROXY_2_PORT:-}"; TCP2_APP="${RAILWAY_TCP_PROXY_2_APPLICATION_PORT:-}"; TCP3_HOST="${RAILWAY_TCP_PROXY_3_DOMAIN:-}"; TCP3_PORT="${RAILWAY_TCP_PROXY_3_PORT:-}"; TCP3_APP="${RAILWAY_TCP_PROXY_3_APPLICATION_PORT:-}"
-[ -n "$TCP_HOST" ]&&[ -n "$TCP_PORT" ]&&[ -n "$TCP_APP" ]&&[ -n "$TCP2_HOST" ]&&[ -n "$TCP2_PORT" ]&&[ -n "$TCP2_APP" ]&&[ -n "$TCP3_HOST" ]&&[ -n "$TCP3_PORT" ]&&[ -n "$TCP3_APP" ] || { echo "FATAL: all three Railway TCP Proxy runtime variables are required" >&2; exit 1; }
+# Railway does not inject TCP Proxy metadata into the container. Accept explicit
+# overrides when supplied; otherwise use the three proxy endpoints configured
+# for this four-entry release.
+TCP_HOST="${RAILWAY_TCP_PROXY_DOMAIN:-reseau.proxy.rlwy.net}"; TCP_PORT="${RAILWAY_TCP_PROXY_PORT:-23337}"; TCP_APP="${RAILWAY_TCP_APPLICATION_PORT:-8081}"
+TCP2_HOST="${RAILWAY_TCP_PROXY_2_DOMAIN:-interchange.proxy.rlwy.net}"; TCP2_PORT="${RAILWAY_TCP_PROXY_2_PORT:-23389}"; TCP2_APP="${RAILWAY_TCP_PROXY_2_APPLICATION_PORT:-8082}"
+TCP3_HOST="${RAILWAY_TCP_PROXY_3_DOMAIN:-altaria.proxy.rlwy.net}"; TCP3_PORT="${RAILWAY_TCP_PROXY_3_PORT:-17903}"; TCP3_APP="${RAILWAY_TCP_PROXY_3_APPLICATION_PORT:-8083}"
 [ "$TCP_APP:$TCP2_APP:$TCP3_APP" = "8081:8082:8083" ] || { echo "FATAL: TCP targets must be 8081:8082:8083" >&2; exit 1; }
 UUID_FILE="$D/uuid.txt"; PRIV_FILE="$D/reality_private_key.txt"; PUB_FILE="$D/reality_public_key.txt"; TOKEN_FILE="$D/subscription_token.txt"
 if [ -s "$UUID_FILE" ];then UUID=$(tr -d '[:space:]'<"$UUID_FILE");else UUID=$(xray uuid);write_secret "$UUID_FILE" "$UUID";fi

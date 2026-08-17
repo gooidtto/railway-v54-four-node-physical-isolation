@@ -2,18 +2,16 @@
 import asyncio, base64, os, re, struct, urllib.parse
 from pathlib import Path
 
-PORT=int(os.environ.get("GATEWAY_PORT","8080"))
-D=Path(os.environ.get("DATA_DIR","/data")); SITE=Path("/opt/xray/site/index.html")
-TOKEN=D/"subscription_token.txt"; SUB=D/"subscription.txt"
-XHTTP_DEST=("127.0.0.1",10086); REALITY_DEST=("127.0.0.1",10087); GRPC_DEST=("127.0.0.1",10088); WS_DEST=("127.0.0.1",10089)
-RAW_SNI=os.environ.get("REALITY_RAW_SNI","www.cloudflare.com").strip(); GRPC_SNI=os.environ.get("REALITY_GRPC_SNI","www.apple.com").strip(); WS_SNI=os.environ.get("WS_HOST","").strip()
-SEM=asyncio.Semaphore(int(os.environ.get("GATEWAY_MAX_CONNECTIONS","512"))); TIMEOUT=float(os.environ.get("GATEWAY_READ_TIMEOUT","15"))
+PORT=int(os.environ.get("GATEWAY_PORT","8080"));D=Path(os.environ.get("DATA_DIR","/data"));SITE=Path("/opt/xray/site/index.html")
+TOKEN=D/"subscription_token.txt";SUB=D/"subscription.txt";XHTTP_DEST=("127.0.0.1",10086);REALITY_DEST=("127.0.0.1",10087);GRPC_DEST=("127.0.0.1",10088);WS_DEST=("127.0.0.1",10089)
+RAW_SNI=os.environ.get("REALITY_RAW_SNI","www.cloudflare.com").strip();GRPC_SNI=os.environ.get("REALITY_GRPC_SNI","www.apple.com").strip();WS_SNI=os.environ.get("WS_HOST","").strip()
+SEM=asyncio.Semaphore(int(os.environ.get("GATEWAY_MAX_CONNECTIONS","512")));TIMEOUT=float(os.environ.get("GATEWAY_READ_TIMEOUT","15"));MAX_INITIAL=65536
 HTTP=(b"GET ",b"POST ",b"HEAD ",b"PUT ",b"OPTIONS ",b"PATCH ",b"DELETE ",b"PRI * HTTP/2.0")
 
 def subscription(token):
-    if not TOKEN.exists() or token != TOKEN.read_text().strip(): return None,"TOKEN_INVALID"
+    if not TOKEN.exists() or token!=TOKEN.read_text().strip():return None,"TOKEN_INVALID"
     lines=[x.strip() for x in SUB.read_text().splitlines() if x.strip()]
-    if len(lines)!=4 or any(not x.startswith("vless://") for x in lines): return None,"SUB_INVALID"
+    if len(lines)!=4 or any(not x.startswith("vless://") for x in lines):return None,"SUB_INVALID"
     return base64.b64encode("\n".join(lines).encode()),"OK"
 
 def tls_sni(buf):
@@ -48,6 +46,23 @@ def tls_sni(buf):
         p+=ln
     return None
 
+async def read_initial(reader):
+    buf=bytearray();deadline=asyncio.get_running_loop().time()+TIMEOUT
+    while len(buf)<MAX_INITIAL:
+        left=max(0.05,deadline-asyncio.get_running_loop().time())
+        try:chunk=await asyncio.wait_for(reader.read(min(8192,MAX_INITIAL-len(buf))),left)
+        except asyncio.TimeoutError:break
+        if not chunk:break
+        buf.extend(chunk)
+        b=bytes(buf)
+        if b.startswith(HTTP):
+            if b"\r\n\r\n" in b or len(b)>8192:return b
+        elif tls_sni(b) is not None:return b
+        elif len(b)>=5 and b[0]==0x16 and b[1]==0x03:
+            if len(b)>=5+struct.unpack("!H",b[3:5])[0]:return b
+        elif len(b)>=1 and b[0] not in (0x16,):return b
+    return bytes(buf)
+
 async def pipe(r,w):
     try:
         while True:
@@ -59,10 +74,8 @@ async def pipe(r,w):
 async def relay(reader,writer,initial,dest,label):
     up=None;tasks=set()
     try:
-        ur,up=await asyncio.open_connection(*dest);up.write(initial);await up.drain()
-        print(f"[gateway] ROUTE={label} sni={tls_sni(initial) or '-'} target={dest[0]}:{dest[1]}",flush=True)
-        tasks={asyncio.create_task(pipe(reader,up)),asyncio.create_task(pipe(ur,writer))}
-        done,pending=await asyncio.wait(tasks,return_when=asyncio.FIRST_COMPLETED)
+        ur,up=await asyncio.open_connection(*dest);up.write(initial);await up.drain();print(f"[gateway] ROUTE={label} sni={tls_sni(initial) or '-'} target={dest[0]}:{dest[1]}",flush=True)
+        tasks={asyncio.create_task(pipe(reader,up)),asyncio.create_task(pipe(ur,writer))};done,pending=await asyncio.wait(tasks,return_when=asyncio.FIRST_COMPLETED)
         for t in done:
             try:t.result()
             except Exception:pass
@@ -97,7 +110,7 @@ async def http(reader,writer,initial):
 async def handle(reader,writer):
     async with SEM:
         try:
-            initial=await asyncio.wait_for(reader.read(65536),TIMEOUT)
+            initial=await read_initial(reader)
             if not initial:return
             if initial.startswith(HTTP):await http(reader,writer,initial);return
             sni=tls_sni(initial)
@@ -111,8 +124,7 @@ async def handle(reader,writer):
             except Exception:pass
 
 async def main():
-    server=await asyncio.start_server(handle,"0.0.0.0",PORT,limit=65536)
-    print(f"GATEWAY_READY={PORT}",flush=True);print(f"ROUTES=http->10086;reality:{RAW_SNI}->10087;grpc:{GRPC_SNI}->10088;ws:{WS_SNI}->10089",flush=True)
+    server=await asyncio.start_server(handle,"0.0.0.0",PORT,limit=65536);print(f"GATEWAY_READY={PORT}",flush=True);print(f"ROUTES=http->10086;reality:{RAW_SNI}->10087;grpc:{GRPC_SNI}->10088;ws:{WS_SNI}->10089",flush=True)
     try:await server.serve_forever()
     finally:server.close();await server.wait_closed()
 

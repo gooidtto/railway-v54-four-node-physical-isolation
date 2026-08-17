@@ -45,22 +45,60 @@ async def pipe(reader, writer):
             await writer.drain()
     except (ConnectionError, asyncio.CancelledError):
         return
+    except Exception as exc:
+        print(f"[gateway] pipe error={type(exc).__name__}: {exc}", flush=True)
 
 
 async def relay_to(reader, writer, initial, dest, label):
-    up = None
+    upstream = None
+    tasks = set()
     try:
-        up_r, up = await asyncio.open_connection(*dest)
-        up.write(initial)
-        await up.drain()
-        print(f"[gateway] ROUTE={label} port={writer.get_extra_info('sockname')[1]} peer={writer.get_extra_info('peername')} target={dest[0]}:{dest[1]}", flush=True)
-        await asyncio.gather(pipe(reader, up), pipe(up_r, writer))
-    except Exception as e:
-        print(f"[gateway] relay={label} error={type(e).__name__}: {e}", flush=True)
+        up_r, upstream = await asyncio.open_connection(*dest)
+        upstream.write(initial)
+        await upstream.drain()
+        local_port = writer.get_extra_info("sockname")[1]
+        peer = writer.get_extra_info("peername")
+        print(f"[gateway] ROUTE={label} port={local_port} peer={peer} target={dest[0]}:{dest[1]}", flush=True)
+
+        tasks = {
+            asyncio.create_task(pipe(reader, upstream)),
+            asyncio.create_task(pipe(up_r, writer)),
+        }
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            try:
+                task.result()
+            except (ConnectionError, asyncio.CancelledError):
+                pass
+            except Exception as exc:
+                print(f"[gateway] relay={label} task error={type(exc).__name__}: {exc}", flush=True)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+    except (ConnectionError, asyncio.TimeoutError) as exc:
+        print(f"[gateway] relay={label} connection={type(exc).__name__}: {exc}", flush=True)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        print(f"[gateway] relay={label} error={type(exc).__name__}: {exc}", flush=True)
     finally:
-        for w in (writer, up):
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        for w in (writer, upstream):
             if w:
-                w.close()
+                try:
+                    w.close()
+                except Exception:
+                    pass
+        if upstream:
+            try:
+                await upstream.wait_closed()
+            except Exception:
+                pass
 
 
 async def handle_http(reader, writer, initial):
@@ -122,9 +160,9 @@ async def handle(reader, writer):
             if not initial:
                 return
 
-            # Both Railway entry ports terminate at this same protocol-aware
-            # gateway. HTTP goes to the private XHTTP listener; a TLS
-            # ClientHello is forwarded byte-for-byte to REALITY.
+            # Both Railway entry ports terminate at the same protocol-aware
+            # gateway. HTTP is forwarded to XHTTP; TLS ClientHello is forwarded
+            # byte-for-byte to the private REALITY listener.
             if is_tls_client_hello(initial):
                 await relay_to(reader, writer, initial, REALITY_DEST, "tls-reality")
                 return
@@ -134,9 +172,10 @@ async def handle(reader, writer):
                 return
 
             print(f"[gateway] REJECT peer={peer} unknown protocol", flush=True)
-            writer.close()
-        except Exception as e:
-            print(f"[gateway] ERROR peer={peer}: {type(e).__name__}: {e}", flush=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"[gateway] ERROR peer={peer}: {type(exc).__name__}: {exc}", flush=True)
         finally:
             try:
                 writer.close()
@@ -156,6 +195,7 @@ async def main():
         for serve in servers:
             serve.close()
             await serve.wait_closed()
+        await asyncio.gather(*(serve.wait_closed() for serve in servers), return_exceptions=True)
 
 
 if __name__ == "__main__":

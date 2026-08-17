@@ -21,21 +21,13 @@ def endpoint(env_domain, env_port, fallback_domain, fallback_port):
     if not h or not 1<=p<=65535:raise SystemExit(f"FATAL: invalid endpoint {h}:{p}")
     return {"domain":h,"port":p,"application_port":APP_PORT}
 
-# Railway only injects the canonical RAILWAY_TCP_PROXY_* pair for the currently
-# selected TCP proxy. Additional TCP proxies are supplied as explicit service
-# variables. Support both the descriptive TCP_PROXY_* names and the older
-# RAILWAY_TCP_PROXY_* aliases so existing deployments remain compatible.
 p1=endpoint("RAILWAY_TCP_PROXY_DOMAIN","RAILWAY_TCP_PROXY_PORT","shuttle.proxy.rlwy.net","50612")
 p2=endpoint("TCP_PROXY_2_DOMAIN","TCP_PROXY_2_PORT","interchange.proxy.rlwy.net","23389")
-if os.environ.get("RAILWAY_TCP_PROXY_2_DOMAIN"):
-    p2["domain"]=os.environ["RAILWAY_TCP_PROXY_2_DOMAIN"].strip()
-if os.environ.get("RAILWAY_TCP_PROXY_2_PORT"):
-    p2["port"]=int(os.environ["RAILWAY_TCP_PROXY_2_PORT"])
+if os.environ.get("RAILWAY_TCP_PROXY_2_DOMAIN"): p2["domain"]=os.environ["RAILWAY_TCP_PROXY_2_DOMAIN"].strip()
+if os.environ.get("RAILWAY_TCP_PROXY_2_PORT"): p2["port"]=int(os.environ["RAILWAY_TCP_PROXY_2_PORT"])
 p3=endpoint("TCP_PROXY_3_DOMAIN","TCP_PROXY_3_PORT","altaria.proxy.rlwy.net","17903")
-if os.environ.get("RAILWAY_TCP_PROXY_3_DOMAIN"):
-    p3["domain"]=os.environ["RAILWAY_TCP_PROXY_3_DOMAIN"].strip()
-if os.environ.get("RAILWAY_TCP_PROXY_3_PORT"):
-    p3["port"]=int(os.environ["RAILWAY_TCP_PROXY_3_PORT"])
+if os.environ.get("RAILWAY_TCP_PROXY_3_DOMAIN"): p3["domain"]=os.environ["RAILWAY_TCP_PROXY_3_DOMAIN"].strip()
+if os.environ.get("RAILWAY_TCP_PROXY_3_PORT"): p3["port"]=int(os.environ["RAILWAY_TCP_PROXY_3_PORT"])
 
 FP=os.environ.get("REALITY_FINGERPRINT","chrome").strip() or "chrome"
 RAW_SNI=os.environ.get("REALITY_RAW_SNI","www.cloudflare.com").strip() or "www.cloudflare.com"
@@ -57,10 +49,12 @@ def reality(tag,port,flow,sni,target,sid,network):
     client={"id":UUID,"level":0}
     if flow:client["flow"]=flow
     ss={"network":network,"security":"reality","realitySettings":{"show":False,"target":target,"serverNames":[sni],"privateKey":PRIVATE_KEY,"shortIds":[sid]}}
-    if network=="grpc":ss["grpcSettings"]={"serviceName":GRPC_SERVICE,"multiMode":True}
+    if network=="grpc":ss["grpcSettings"]={"serviceName":GRPC_SERVICE,"multiMode":False}
     return {"tag":tag,"listen":"127.0.0.1","port":port,"protocol":"vless","settings":{"clients":[client],"decryption":"none"},"streamSettings":ss}
 
 reality_raw=reality("vless-reality-vision",10087,"xtls-rprx-vision",RAW_SNI,RAW_TARGET,ids[0],"tcp")
+# Use legacy/maximum-compatible gRPC gun mode for subscription clients.
+# multiMode is deliberately disabled so the generated URI remains widely importable.
 reality_grpc=reality("vless-reality-grpc",10088,"",GRPC_SNI,GRPC_TARGET,ids[1],"grpc")
 xhttp={"tag":"vless-xhttp-tls","listen":"127.0.0.1","port":10086,"protocol":"vless","settings":{"clients":[{"id":UUID,"level":0}],"decryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"path":XPATH,"mode":"auto"}}}
 ws_tls={"tag":"vless-ws-tls","listen":"127.0.0.1","port":10089,"protocol":"vless","settings":{"clients":[{"id":UUID,"level":0}],"decryption":"none"},"streamSettings":{"network":"ws","security":"tls","tlsSettings":{"alpn":["http/1.1"],"certificates":[{"certificateFile":str(WS_CERT),"keyFile":str(WS_KEY)}]},"wsSettings":{"path":WS_PATH,"headers":{"Host":WS_HOST}}}}
@@ -73,18 +67,20 @@ def link(host,port,params,name):return f"vless://{UUID}@{host}:{port}?{q(params)
 lines=[
 link(PUBLIC_DOMAIN,443,{"encryption":"none","security":"tls","sni":PUBLIC_DOMAIN,"fp":FP,"alpn":"h2,http/1.1","type":"xhttp","path":XPATH,"mode":"auto"},"VLESS XHTTP TLS · Railway Domain"),
 link(p1["domain"],p1["port"],{"encryption":"none","flow":"xtls-rprx-vision","security":"reality","sni":RAW_SNI,"fp":FP,"pbk":PUBLIC_KEY,"sid":ids[0],"type":"tcp"},"VLESS RAW REALITY Vision · TCP Proxy 1"),
-link(p2["domain"],p2["port"],{"encryption":"none","security":"reality","sni":GRPC_SNI,"fp":FP,"pbk":PUBLIC_KEY,"sid":ids[1],"type":"grpc","serviceName":GRPC_SERVICE,"mode":"multi"},"VLESS gRPC REALITY · TCP Proxy 2"),
+link(p2["domain"],p2["port"],{"encryption":"none","security":"reality","sni":GRPC_SNI,"fp":FP,"pbk":PUBLIC_KEY,"sid":ids[1],"type":"grpc","serviceName":GRPC_SERVICE,"mode":"gun"},"VLESS gRPC REALITY · TCP Proxy 2"),
+# Keep WS URI minimal and client-compatible. allowInsecure is required because the WS
+# listener uses the persisted local certificate rather than a Railway-managed cert.
 link(p3["domain"],p3["port"],{"encryption":"none","security":"tls","sni":WS_HOST,"fp":FP,"alpn":"http/1.1","type":"ws","host":WS_HOST,"path":WS_PATH,"allowInsecure":"1"},"VLESS WS TLS · TCP Proxy 3")]
 if len(lines)!=NODE_COUNT:raise SystemExit(f"FATAL: subscription invariant failed: expected {NODE_COUNT}, got {len(lines)}")
-state={"schema":12,"build":"fixed-single-8080-router-v2","architecture":"single-8080-protocol-router","node_count":4,"public_domain":PUBLIC_DOMAIN,"application_port":8080,"router":{"http":10086,"raw_reality":10087,"grpc_reality":10088,"ws_tls":10089,"sni":{"raw":RAW_SNI,"grpc":GRPC_SNI,"ws":WS_HOST}},"tcp_proxies":[p1,p2,p3],"reality":{"raw":{"target":RAW_TARGET,"sni":RAW_SNI,"short_id":ids[0]},"grpc":{"target":GRPC_TARGET,"sni":GRPC_SNI,"short_id":ids[1]},"grpc_multi_mode":True},"ws":{"host":WS_HOST,"path":WS_PATH},"grpc":{"service_name":GRPC_SERVICE,"mode":"multi"}}
+state={"schema":13,"build":"fixed-single-8080-router-v3","architecture":"single-8080-protocol-router","node_count":4,"public_domain":PUBLIC_DOMAIN,"application_port":8080,"router":{"http":10086,"raw_reality":10087,"grpc_reality":10088,"ws_tls":10089,"sni":{"raw":RAW_SNI,"grpc":GRPC_SNI,"ws":WS_HOST}},"tcp_proxies":[p1,p2,p3],"reality":{"raw":{"target":RAW_TARGET,"sni":RAW_SNI,"short_id":ids[0]},"grpc":{"target":GRPC_TARGET,"sni":GRPC_SNI,"short_id":ids[1]}},"ws":{"host":WS_HOST,"path":WS_PATH},"grpc":{"service_name":GRPC_SERVICE,"mode":"gun"}}
 fingerprint=hashlib.sha256(json.dumps(state,sort_keys=True,separators=(",",":")).encode()).hexdigest();state["fingerprint"]=fingerprint
 (D/"state.json").write_text(json.dumps(state,indent=2)+"\n");(D/"subscription.txt.tmp").write_text("\n".join(lines)+"\n");os.replace(D/"subscription.txt.tmp",D/"subscription.txt")
-(D/"manifest.json").write_text(json.dumps({"schema":12,"build":"fixed-single-8080-router-v2","node_count":4,"architecture":"single-8080-protocol-router","application_port":8080,"distribution":{"443":"xhttp-tls","tcp-proxy-1":"sni-raw-reality","tcp-proxy-2":"sni-grpc-reality","tcp-proxy-3":"sni-ws-tls"},"state_fingerprint":fingerprint},indent=2)+"\n")
-print("RELEASE=fixed-single-8080-router-v2",flush=True)
+(D/"manifest.json").write_text(json.dumps({"schema":13,"build":"fixed-single-8080-router-v3","node_count":4,"architecture":"single-8080-protocol-router","application_port":8080,"distribution":{"443":"xhttp-tls","tcp-proxy-1":"sni-raw-reality","tcp-proxy-2":"sni-grpc-reality","tcp-proxy-3":"sni-ws-tls"},"state_fingerprint":fingerprint},indent=2)+"\n")
+print("RELEASE=fixed-single-8080-router-v3",flush=True)
 print("ARCHITECTURE=single-8080-protocol-router",flush=True)
 print("SUBSCRIPTION_INVARIANT=4",flush=True)
 print(f"DOMAIN {PUBLIC_DOMAIN}:443 -> 8080 -> 10086 XHTTP TLS",flush=True)
 print(f"TCP1 {p1['domain']}:{p1['port']} -> 8080 -> SNI {RAW_SNI} -> 10087 REALITY Vision",flush=True)
-print(f"TCP2 {p2['domain']}:{p2['port']} -> 8080 -> SNI {GRPC_SNI} -> 10088 gRPC REALITY multi",flush=True)
+print(f"TCP2 {p2['domain']}:{p2['port']} -> 8080 -> SNI {GRPC_SNI} -> 10088 gRPC REALITY gun",flush=True)
 print(f"TCP3 {p3['domain']}:{p3['port']} -> 8080 -> SNI {WS_HOST} -> 10089 WS TLS",flush=True)
 print("NODES=4",flush=True)

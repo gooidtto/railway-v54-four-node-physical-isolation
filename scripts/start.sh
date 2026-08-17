@@ -2,7 +2,7 @@
 set -eu
 umask 077
 
-BUILD_ID="fixed-8-node-baseline-v2"
+BUILD_ID="fixed-8-node-unified"
 D="${RAILWAY_VOLUME_MOUNT_PATH:-${DATA_DIR:-/data}}"
 C="${XRAY_CONFIG:-/etc/xray/config.json}"
 mkdir -p "$D" "$(dirname "$C")"
@@ -53,10 +53,6 @@ TCP_APP="${RAILWAY_TCP_APPLICATION_PORT:-}"
 [ -n "$PUBLIC_DOMAIN" ] || { echo "missing RAILWAY_PUBLIC_DOMAIN" >&2; exit 1; }
 [ -n "$TCP_HOST" ] && [ -n "$TCP_PORT" ] || { echo "missing RAILWAY_TCP_PROXY_DOMAIN/PORT" >&2; exit 1; }
 
-# Railway deployments in the current service may already have the TCP Proxy
-# targeting 8081. Keep that existing setting working while also serving the
-# Generate Domain healthcheck/HTTP traffic on 8080. The gateway listens on
-# both ports; Xray itself remains private on 10086/10087.
 case "$TCP_APP" in
   8080|8081) : ;;
   *) echo "unsupported Railway TCP Proxy target: ${TCP_APP:-unset}; expected 8080 or 8081" >&2; exit 1 ;;
@@ -65,6 +61,7 @@ esac
 export DATA_DIR="$D" XRAY_CONFIG="$C"
 export UUID PRIVATE_KEY PUBLIC_KEY PUBLIC_DOMAIN
 export RAILWAY_TCP_PROXY_DOMAIN="$TCP_HOST" RAILWAY_TCP_PROXY_PORT="$TCP_PORT"
+export RAILWAY_TCP_APPLICATION_PORT="$TCP_APP"
 export XRAY_HTTP_PORT=10086 XRAY_REALITY_PORT=10087
 export GATEWAY_PORTS="8080,8081"
 export REALITY_SNI_CANDIDATES_FILE="${REALITY_SNI_CANDIDATES_FILE:-/opt/xray/config/reality-sni-candidates.txt}"
@@ -98,7 +95,7 @@ printf '%s/sub/%s\n' "https://${PUBLIC_DOMAIN}" "$TOKEN" > "$D/subscription_url.
 chmod 600 "$D/subscription_url.txt"
 
 echo "BUILD=$BUILD_ID"
-echo "TOPOLOGY=8080+8081/gateway 10086/xhttp-tls 10087/reality-7-sni"
+echo "TOPOLOGY=GenerateDomain:443->gateway:8080->xhttp:10086; TCP:${TCP_HOST}:${TCP_PORT}->gateway:${TCP_APP}->reality:10087"
 echo "TCP_PROXY=${TCP_HOST}:${TCP_PORT} -> ${TCP_APP}"
 echo "GATEWAY_LISTEN=8080,8081"
 echo "REALITY_SNI_COUNT=7"

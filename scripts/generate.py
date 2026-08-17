@@ -42,7 +42,7 @@ try:
     P1_PORT = int(P1_PORT_RAW)
     P1_APP = int(P1_APP_RAW)
 except ValueError:
-    raise SystemExit("invalid RAILWAY_TCP_PROXY_PORT/RAILWAY_TCP_APPLICATION_PORT")
+    raise SystemExit("invalid primary Railway TCP Proxy settings")
 if not P1_HOST or not 1 <= P1_PORT <= 65535 or P1_APP not in (8081, 8082, 8083):
     raise SystemExit("invalid primary Railway TCP Proxy settings")
 
@@ -63,7 +63,6 @@ sni_values = [x.strip() for x in sni_file.read_text().splitlines() if x.strip()]
 if len(sni_values) != 1:
     raise SystemExit(f"fixed baseline requires exactly 1 target-compatible REALITY SNI, got {len(sni_values)}")
 reality_sni = sni_values[0]
-snis = [reality_sni] * NODE_COUNT
 
 short_file = D / "short_id.txt"
 legacy_short = short_file.read_text().strip() if short_file.exists() else ""
@@ -93,9 +92,9 @@ short_file.write_text(short_ids[0] + "\n")
 reality_target = os.environ.get("REALITY_TARGET", "www.cloudflare.com:443").strip()
 if not reality_target:
     raise SystemExit("REALITY_TARGET must not be empty")
-fp = os.environ.get("REALITY_FINGERPRINT", "chrome")
-xpath = os.environ.get("XHTTP_PATH", "/xhttp")
-xmode = os.environ.get("XHTTP_MODE", "auto")
+fp = os.environ.get("REALITY_FINGERPRINT", "chrome").strip() or "chrome"
+xpath = os.environ.get("XHTTP_PATH", "/xhttp").strip() or "/xhttp"
+xmode = os.environ.get("XHTTP_MODE", "auto").strip() or "auto"
 
 reality = {
     "tag": "vless-reality-7-node-stable",
@@ -134,8 +133,8 @@ cfg = {
 C.write_text(json.dumps(cfg, indent=2) + "\n")
 
 state = {
-    "schema": 5,
-    "build": "fixed-8-node-three-tcp-stable-reality",
+    "schema": 6,
+    "build": "fixed-8-node-three-tcp-strict-uri",
     "mode": "railway-gateway-8080-8081-8082-8083",
     "uuid": UUID,
     "public_key": PUBLIC_KEY,
@@ -153,32 +152,69 @@ state["fingerprint"] = fingerprint
 (D / "state.json").write_text(json.dumps(state, indent=2) + "\n")
 
 
-def vless(host, port, params, name):
-    return f"vless://{UUID}@{host}:{port}?{urllib.parse.urlencode(params, doseq=True)}#{urllib.parse.quote(name)}"
+def encode_params(params):
+    clean = {}
+    for key, value in params.items():
+        if value is None:
+            continue
+        value = str(value)
+        if value == "":
+            continue
+        clean[key] = value
+    return urllib.parse.urlencode(clean, doseq=True, safe="")
 
+
+def vless(host, port, params, name):
+    query = encode_params(params)
+    return f"vless://{UUID}@{host}:{port}?{query}#{urllib.parse.quote(name, safe='')}"
+
+
+# Strict canonical Railway-domain URI. Do NOT add flow, host, pbk, sid,
+# spx, allowInsecure, fragment, os, or other client-only empty parameters.
+# TLS is terminated by Railway; Xray receives plaintext XHTTP on 10086.
 lines = [vless(PUBLIC_DOMAIN, 443, {
-    "encryption": "none", "security": "tls", "sni": PUBLIC_DOMAIN, "fp": fp,
-    "alpn": "h2,http/1.1", "type": "xhttp", "path": xpath, "mode": xmode
+    "encryption": "none",
+    "security": "tls",
+    "sni": PUBLIC_DOMAIN,
+    "fp": fp,
+    "alpn": "h2,http/1.1",
+    "type": "xhttp",
+    "path": xpath,
+    "mode": xmode,
 }, "VLESS XHTTP TLS · Railway Domain")]
 
 for i in range(1, NODE_COUNT + 1):
     proxy = proxies[0] if i <= 3 else proxies[1] if i <= 5 else proxies[2]
     sid = short_ids[i - 1]
     lines.append(vless(proxy["domain"], proxy["port"], {
-        "encryption": "none", "flow": "xtls-rprx-vision", "security": "reality",
-        "sni": reality_sni, "fp": fp, "pbk": PUBLIC_KEY, "sid": sid, "type": "tcp"
+        "encryption": "none",
+        "flow": "xtls-rprx-vision",
+        "security": "reality",
+        "sni": reality_sni,
+        "fp": fp,
+        "pbk": PUBLIC_KEY,
+        "sid": sid,
+        "type": "tcp",
     }, f"VLESS REALITY Vision {i:02d} · {reality_sni} · TCP {proxy['application_port']} · SID {sid}"))
 
 if len(lines) != 8:
     raise SystemExit(f"subscription generation invariant failed: expected 8 nodes, got {len(lines)}")
+
+# Strict URI validation prevents malformed/empty parameters from reaching the subscription.
+for idx, line in enumerate(lines, 1):
+    parsed = urllib.parse.urlsplit(line)
+    if parsed.scheme != "vless" or not parsed.hostname or not parsed.port:
+        raise SystemExit(f"node {idx}: invalid VLESS URI")
+    if any(k in parsed.query.split("&") for k in ("flow=", "host=", "pbk=", "sid=", "spx=", "allowInsecure=", "fragment=", "os=")):
+        raise SystemExit(f"node {idx}: forbidden empty/client-only URI parameter")
 
 sub_tmp = D / "subscription.txt.tmp"
 sub_tmp.write_text("\n".join(lines) + "\n")
 os.replace(sub_tmp, D / "subscription.txt")
 
 manifest = {
-    "schema": 5,
-    "build": "fixed-8-node-three-tcp-stable-reality",
+    "schema": 6,
+    "build": "fixed-8-node-three-tcp-strict-uri",
     "mode": "railway-gateway-8080-8081-8082-8083",
     "gateway": {"listen": GATEWAY_PORTS, "http_target": HTTP_PORT, "tls_target": REALITY_PORT},
     "tcp_proxies": proxies,
@@ -194,16 +230,16 @@ manifest = {
             "public": [[p["domain"], p["port"], p["application_port"]] for p in proxies]
         }
     },
-    "subscription": {"file": str(D / "subscription.txt"), "node_count": len(lines)},
+    "subscription": {"file": str(D / "subscription.txt"), "node_count": len(lines), "uri_policy": "strict-canonical"},
     "state_fingerprint": fingerprint
 }
 (D / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
-print("BUILD=fixed-8-node-three-tcp-stable-reality", flush=True)
+print("BUILD=fixed-8-node-three-tcp-strict-uri", flush=True)
 print(f"GATEWAY_PORTS={','.join(map(str, GATEWAY_PORTS))}", flush=True)
 for n, p in enumerate(proxies, 1):
     print(f"TCP_PROXY_{n}={p['domain']}:{p['port']} -> gateway:{p['application_port']}", flush=True)
 print(f"REALITY=127.0.0.1:{REALITY_PORT} TARGET={reality_target} SNI={reality_sni} SHORT_IDS=7 DISTRIBUTION=3,2,2", flush=True)
 print(f"XHTTP_TLS={PUBLIC_DOMAIN}:443 -> gateway:8080 -> 127.0.0.1:{HTTP_PORT}", flush=True)
-print(f"SUBSCRIPTION_NODES={len(lines)}", flush=True)
+print(f"SUBSCRIPTION_NODES={len(lines)} URI_POLICY=strict-canonical", flush=True)
 print(f"STATE_FINGERPRINT={fingerprint}", flush=True)

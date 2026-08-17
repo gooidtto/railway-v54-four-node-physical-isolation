@@ -1,13 +1,14 @@
 {
-  "release": "v54-four-node-physical-isolation",
-  "architecture": "one-xray-core-three-tcp-proxies-one-http-domain",
+  "release": "fixed-8-node-baseline",
+  "architecture": "one-xray-core-one-http-domain-one-tcp-proxy-seven-reality-sni",
+  "gateway_port": 8080,
   "internal_ports": {
-    "gateway_http": 8080,
-    "vision": 8081,
-    "xhttp_reality": 8082,
-    "grpc_reality": 8083,
-    "xhttp_tls": 10086
+    "xhttp_tls": 10086,
+    "reality": 10087
   },
-  "nodes": 4,
-  "stale_endpoint_rejected": "altaria.proxy.rlwy.net:32227"
+  "nodes": 8,
+  "https_xhttp_nodes": 1,
+  "reality_vision_nodes": 7,
+  "tcp_proxy_target": 8080,
+  "reality_sni_count": 7
 }

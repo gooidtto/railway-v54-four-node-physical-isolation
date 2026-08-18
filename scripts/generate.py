@@ -35,12 +35,14 @@ RAW_TARGET = os.environ.get("REALITY_RAW_TARGET", "www.cloudflare.com:443").stri
 XHTTP_TARGET = os.environ.get("REALITY_XHTTP_TARGET", "www.apple.com:443").strip() or "www.apple.com:443"
 XPATH = os.environ.get("XHTTP_PATH", "/xhttp").strip() or "/xhttp"
 
+
 def env_first(*names):
     for name in names:
         value = (os.environ.get(name) or "").strip()
         if value:
             return value
     return ""
+
 
 CF_TOKEN = env_first("CLOUDFLARE_TUNNEL_TOKEN", "CF_TUNNEL_TOKEN", "TUNNEL_TOKEN")
 CF_HOST = env_first("CLOUDFLARE_PUBLIC_HOSTNAME", "CF_PUBLIC_HOSTNAME").lower()
@@ -49,8 +51,9 @@ CF_PORT_RAW = env_first("WS_PORT", "CLOUDFLARE_WS_PORT", "CF_WS_PORT")
 CF_PATH = env_first("WS_PATH", "CLOUDFLARE_WS_PATH", "CF_WS_PATH")
 CF_ID = env_first("CLOUDFLARE_TUNNEL_ID", "CF_TUNNEL_ID", "TUNNEL_ID")
 
-# WS_PORT is authoritative. ORIGIN_SERVICE is normalized to the local WS port
-# so a stale/misformatted Railway variable cannot silently disable node 4.
+# Node 4 is optional: the base Railway deployment is exactly three nodes.
+# Supplying the complete Cloudflare variable set upgrades the generated
+# topology to four nodes; partial configuration is reported as disabled.
 CF_ENABLED = bool(CF_TOKEN and CF_HOST and CF_PORT_RAW and CF_PATH)
 CF_PORT = None
 CF_INVALID_REASON = ""
@@ -91,6 +94,7 @@ while len(ids) < 2:
 ids = ids[:2]
 ids_file.write_text(json.dumps(ids, indent=2) + "\n")
 
+
 def reality(tag, port, network, sni, target, sid, flow=""):
     client = {"id": UUID, "level": 0}
     if flow:
@@ -116,6 +120,7 @@ def reality(tag, port, network, sni, target, sid, flow=""):
         "settings": {"clients": [client], "decryption": "none"},
         "streamSettings": ss,
     }
+
 
 xhttp_tls = {
     "tag": "vless-xhttp-tls",
@@ -150,17 +155,20 @@ if CF_ENABLED:
 
 config = {
     "log": {"loglevel": os.environ.get("XRAY_LOGLEVEL", "warning")},
-    "policy": {"levels": {"0": {"handshake": 8, "connIdle": 900, "uplinkOnly": 2, "downlinkOnly": 5}}},
+    "policy": {"levels": {"0": {"handshake": 8, "connIdle": 900, "uplinkOnly": 2, "downlinkOnly": 5}},
     "inbounds": inbounds,
     "outbounds": [{"tag": "direct", "protocol": "freedom"}, {"tag": "block", "protocol": "blackhole"}],
 }
 C.write_text(json.dumps(config, indent=2) + "\n")
 
+
 def q(d):
     return urllib.parse.urlencode({k: str(v) for k, v in d.items() if v not in (None, "")}, safe="")
 
+
 def link(host, port, params, name):
     return f'vless://{UUID}@{host}:{port}?{q(params)}#{urllib.parse.quote(name, safe="")}'
+
 
 lines = [
     link(PUBLIC_DOMAIN, 443, {
@@ -190,7 +198,7 @@ if NODE_COUNT not in (3, 4):
 
 runtime = {
     "schema": 22,
-    "build": "stable-optional-cloudflare-ws-v3",
+    "build": "stable-optional-cloudflare-ws-v4",
     "architecture": "single-8080-router-plus-optional-cloudflare-tunnel",
     "cloudflare": {
         "enabled": CF_ENABLED,
@@ -231,7 +239,7 @@ os.replace(D / "subscription.txt.tmp", D / "subscription.txt")
 
 manifest = {
     "schema": 22,
-    "build": "stable-optional-cloudflare-ws-v3",
+    "build": "stable-optional-cloudflare-ws-v4",
     "node_count": NODE_COUNT,
     "application_port": APP_PORT,
     "cloudflare_ws_enabled": CF_ENABLED,
@@ -240,7 +248,7 @@ manifest = {
 }
 (D / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
-print("RELEASE=stable-optional-cloudflare-ws-v3", flush=True)
+print("RELEASE=stable-optional-cloudflare-ws-v4", flush=True)
 print("RUNTIME_STATE=/data/runtime.json", flush=True)
 print(f"RUNTIME_FINGERPRINT={runtime['fingerprint']}", flush=True)
 print(f"CLOUDFLARE_WS={'enabled' if CF_ENABLED else 'disabled'}", flush=True)

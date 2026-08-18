@@ -82,6 +82,10 @@ def test_railway_networking_is_runtime_derived_and_not_hard_coded():
     assert "RAILWAY_TCP_PROXY_DOMAIN" in generate
     assert "RAILWAY_TCP_PROXY_PORT" in generate
     assert "RAILWAY_NETWORKING=" in generate
+    assert "RAILWAY_NETWORKING_SOURCE=current-deployment-environment" in generate
+    assert "RAILWAY_NETWORKING_AUTHORITATIVE=true" in generate
+    assert '"source": "current-deployment-environment"' in generate
+    assert '"authoritative": True' in generate
     assert 'networking_state = "initial"' in generate
     assert 'networking_state = "unchanged"' in generate
     assert 'networking_state = "changed"' in generate
@@ -90,6 +94,11 @@ def test_railway_networking_is_runtime_derived_and_not_hard_coded():
     assert '"current_public_domain"' in generate
     assert '"previous_tcp_proxy"' in generate
     assert '"current_tcp_proxy"' in generate
+    # The persisted runtime is explicitly diagnostic-only; it cannot supply
+    # endpoint values for the generated subscription.
+    marker = '# /data/runtime.json is used only as a previous snapshot for diagnostics.'
+    assert marker in generate
+    assert 'Values in /data are never used to generate endpoints.' in generate
 
 
 def test_healthcheck_uses_ready_endpoint():

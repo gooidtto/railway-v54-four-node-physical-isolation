@@ -81,10 +81,15 @@ def test_railway_networking_is_runtime_derived_and_not_hard_coded():
     assert "RAILWAY_PUBLIC_DOMAIN" in generate
     assert "RAILWAY_TCP_PROXY_DOMAIN" in generate
     assert "RAILWAY_TCP_PROXY_PORT" in generate
-    assert "RAILWAY_NETWORKING=" in start
-    assert "RAILWAY_NETWORKING=initial" in start
-    assert "RAILWAY_NETWORKING=unchanged" in start
-    assert "RAILWAY_NETWORKING=changed" in start
+    assert "RAILWAY_NETWORKING=" in generate
+    assert 'networking_state = "initial"' in generate
+    assert 'networking_state = "unchanged"' in generate
+    assert 'networking_state = "changed"' in generate
+    assert '"railway_networking": {' in generate
+    assert '"previous_public_domain"' in generate
+    assert '"current_public_domain"' in generate
+    assert '"previous_tcp_proxy"' in generate
+    assert '"current_tcp_proxy"' in generate
 
 
 def test_healthcheck_uses_ready_endpoint():

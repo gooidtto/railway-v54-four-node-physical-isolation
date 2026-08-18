@@ -199,6 +199,30 @@ NODE_COUNT = len(lines)
 if NODE_COUNT not in (3, 4):
     raise SystemExit(f"FATAL: invalid node count: {NODE_COUNT}")
 
+# Railway Public Networking is intentionally not persisted as the source of
+# truth. Compare the previous runtime only for diagnostics, then always use
+# the current deployment-injected values above to generate the new nodes.
+previous_runtime = {}
+previous_runtime_file = D / "runtime.json"
+if previous_runtime_file.is_file():
+    try:
+        previous_runtime = json.loads(previous_runtime_file.read_text())
+    except Exception:
+        previous_runtime = {}
+
+previous_public = str(previous_runtime.get("public_domain", ""))
+previous_tcp_state = previous_runtime.get("tcp_proxy", {}) or {}
+previous_tcp = ""
+if previous_tcp_state.get("domain") or previous_tcp_state.get("port"):
+    previous_tcp = f"{previous_tcp_state.get('domain', '')}:{previous_tcp_state.get('port', '')}"
+current_tcp = f"{TCP_HOST}:{TCP_PORT}"
+if not previous_runtime:
+    networking_state = "initial"
+elif previous_public == PUBLIC_DOMAIN and previous_tcp == current_tcp:
+    networking_state = "unchanged"
+else:
+    networking_state = "changed"
+
 runtime = {
     "schema": 22,
     "build": "stable-optional-cloudflare-ws-v4",
@@ -226,6 +250,13 @@ runtime = {
     "application_port": APP_PORT,
     "public_domain": PUBLIC_DOMAIN,
     "tcp_proxy": {"domain": TCP_HOST, "port": TCP_PORT, "application_port": APP_PORT},
+    "railway_networking": {
+        "state": networking_state,
+        "previous_public_domain": previous_public,
+        "current_public_domain": PUBLIC_DOMAIN,
+        "previous_tcp_proxy": previous_tcp,
+        "current_tcp_proxy": current_tcp,
+    },
     "routes": {
         "domain_xhttp_tls": {"port": 10086},
         "raw_reality_vision": {"sni": RAW_SNI, "port": 10087, "short_id": ids[0]},
@@ -248,12 +279,19 @@ manifest = {
     "cloudflare_ws_enabled": CF_ENABLED,
     "distribution": runtime["nodes"]["distribution"],
     "runtime_fingerprint": runtime["fingerprint"],
+    "railway_networking_state": networking_state,
 }
 (D / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
 print("RELEASE=stable-optional-cloudflare-ws-v4", flush=True)
 print("RUNTIME_STATE=/data/runtime.json", flush=True)
 print(f"RUNTIME_FINGERPRINT={runtime['fingerprint']}", flush=True)
+print(f"RAILWAY_NETWORKING={networking_state}", flush=True)
+if networking_state == "changed":
+    print(f"RAILWAY_NETWORKING_PREVIOUS_PUBLIC={previous_public or 'missing'}", flush=True)
+    print(f"RAILWAY_NETWORKING_CURRENT_PUBLIC={PUBLIC_DOMAIN}", flush=True)
+    print(f"RAILWAY_NETWORKING_PREVIOUS_TCP={previous_tcp or 'missing'}", flush=True)
+    print(f"RAILWAY_NETWORKING_CURRENT_TCP={current_tcp}", flush=True)
 print(f"CLOUDFLARE_WS={'enabled' if CF_ENABLED else 'disabled'}", flush=True)
 print(f"CF_ENV_TOKEN={'present' if CF_TOKEN else 'missing'}", flush=True)
 print(f"CF_ENV_HOST={'present' if CF_HOST else 'missing'}", flush=True)

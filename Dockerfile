@@ -35,6 +35,7 @@ ENV BUILD_ID=stable-optional-cloudflare-ws-v4 \
     GATEWAY_IDLE_TIMEOUT=900 \
     GATEWAY_MAX_INITIAL=65536 \
     GATEWAY_LOGLEVEL=WARNING
+RUN echo "SOURCE_BUILD=${SOURCE_BUILD} BUILD_ID=${BUILD_ID}"
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=5 CMD python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/ready', timeout=8).read()"
 WORKDIR /opt/xray

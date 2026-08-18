@@ -1,8 +1,6 @@
 #!/bin/sh
 set -eu
 umask 077
-# Release identity is immutable at runtime. Do not inherit a stale Railway
-# environment variable such as BUILD_ID=v3 over the image's v4 identity.
 BUILD_ID="stable-optional-cloudflare-ws-v4"
 SOURCE_BUILD="main-hardened-v4"
 D="${RAILWAY_VOLUME_MOUNT_PATH:-${DATA_DIR:-/data}}"
@@ -25,18 +23,19 @@ TCP_HOST="${RAILWAY_TCP_PROXY_DOMAIN:-}"
 TCP_PORT="${RAILWAY_TCP_PROXY_PORT:-}"
 [ -n "$TCP_HOST" ] && [ -n "$TCP_PORT" ] || { echo "FATAL: one Railway TCP Proxy is required" >&2; exit 1; }
 
+# UUID is intentionally ephemeral: every deployment gets a fresh UUID.
+# Never restore it from the persistent Railway volume. The generated UUID is
+# exported to generate.py, which uses this exact value for both Xray and the
+# newly generated subscription in the same deployment.
 UUID_FILE="$D/uuid.txt"
 PRIV_FILE="$D/reality_private_key.txt"
 PUB_FILE="$D/reality_public_key.txt"
 TOKEN_FILE="$D/subscription_token.txt"
 CF_TOKEN_FILE="$D/cloudflare_tunnel_token.txt"
 
-if [ -s "$UUID_FILE" ]; then
-  UUID=$(tr -d '[:space:]' <"$UUID_FILE")
-else
-  UUID=$(xray uuid)
-  write_secret "$UUID_FILE" "$UUID"
-fi
+UUID=$(xray uuid)
+[ -n "$UUID" ] || { echo "FATAL: failed to generate deployment UUID" >&2; exit 1; }
+write_secret "$UUID_FILE" "$UUID"
 
 if [ -s "$PRIV_FILE" ] && [ -s "$PUB_FILE" ]; then
   PRIVATE_KEY=$(tr -d '[:space:]' <"$PRIV_FILE")
@@ -57,8 +56,6 @@ else
   write_secret "$TOKEN_FILE" "$TOKEN"
 fi
 
-# Normalize Cloudflare variables once. The generator then freezes the
-# resulting state into /data/runtime.json; no later process re-evaluates ENV.
 CF_TOKEN="${CLOUDFLARE_TUNNEL_TOKEN:-${CF_TUNNEL_TOKEN:-${TUNNEL_TOKEN:-}}}"
 CF_ID="${CLOUDFLARE_TUNNEL_ID:-${CF_TUNNEL_ID:-${TUNNEL_ID:-}}}"
 CF_HOST="${CLOUDFLARE_PUBLIC_HOSTNAME:-${CF_PUBLIC_HOSTNAME:-}}"
@@ -137,14 +134,35 @@ if [ "$CF_ENABLED" = 1 ]; then
   [ -n "$CF_TOKEN" ] || { echo "FATAL: runtime state says Cloudflare enabled but tunnel token is unavailable" >&2; exit 1; }
 fi
 
+# Hard invariant: the deployment UUID must be the same in Xray and every
+# freshly generated subscription node. A stale persistent subscription must
+# never survive a deployment with a new UUID.
+python3 - "$C" "$D/subscription.txt" "$UUID" <<'PY'
+import json,re,sys
+from pathlib import Path
+config=json.loads(Path(sys.argv[1]).read_text())
+sub=Path(sys.argv[2]).read_text().splitlines()
+expected=sys.argv[3]
+config_ids=[]
+for inbound in config.get("inbounds", []):
+    for client in inbound.get("settings", {}).get("clients", []):
+        if client.get("id"): config_ids.append(client["id"])
+if not config_ids or any(x != expected for x in config_ids):
+    raise SystemExit("FATAL: Xray UUID does not match current deployment UUID")
+for i,line in enumerate(sub,1):
+    if not line.strip(): continue
+    m=re.match(r"vless://([^@]+)@", line.strip())
+    if not m or m.group(1) != expected:
+        raise SystemExit(f"FATAL: subscription UUID mismatch at node {i}")
+print(f"UUID_INVARIANT=OK uuid={expected}")
+PY
+
 echo "SOURCE_BUILD=$SOURCE_BUILD"
 echo "RUNTIME_STATE=$RUNTIME"
 echo "RUNTIME_FINGERPRINT=$FINGERPRINT"
+echo "DEPLOYMENT_UUID=$UUID"
+echo "UUID_LIFECYCLE=ephemeral-per-deployment"
 echo "CLOUDFLARE_STATE=$([ "$CF_ENABLED" = 1 ] && echo enabled || echo disabled)"
-echo "CLOUDFLARE_HOST_STATE=$([ -n "$CF_HOST_STATE" ] && echo present || echo missing)"
-echo "CLOUDFLARE_ORIGIN_STATE=$([ -n "$CF_ORIGIN_STATE" ] && echo present || echo missing)"
-echo "CLOUDFLARE_PORT_STATE=$([ -n "$CF_PORT_STATE" ] && echo present || echo missing)"
-echo "CLOUDFLARE_PATH_STATE=$([ -n "$CF_PATH_STATE" ] && echo present || echo missing)"
 echo "SUBSCRIPTION_INVARIANT=$EXPECTED"
 
 python3 - "$D/subscription.txt" "$RUNTIME" <<'PY'
@@ -191,7 +209,7 @@ PY
     then echo "READY_CHECK=$label"; return 0; fi
     i=$((i+1)); [ "$i" -lt "${CLOUDFLARE_READY_TIMEOUT:-45}" ] || { echo "FATAL: readiness timeout $label" >&2; exit 1; }
     sleep 1
-  done
+done
 }
 
 wait_port 127.0.0.1 10086 xhttp-http

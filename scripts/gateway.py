@@ -21,10 +21,10 @@ RAW_SNI = os.environ.get("REALITY_RAW_SNI", "www.cloudflare.com").strip().lower(
 XHTTP_SNI = os.environ.get("REALITY_XHTTP_SNI", "www.apple.com").strip().lower().rstrip(".") or "www.apple.com"
 ROUTES = {RAW_SNI: ("127.0.0.1", 10087, "raw-reality-vision"), XHTTP_SNI: ("127.0.0.1", 10088, "xhttp-reality")}
 MAX_CONNECTIONS = max(16, int(os.environ.get("GATEWAY_MAX_CONNECTIONS", "512")))
-INITIAL_TIMEOUT = max(2.0, float(os.environ.get("GATEWAY_READ_TIMEOUT", "15")))
+INITIAL_TIMEOUT = max(2.0, float(os.environ.get("GATEWAY_READ_TIMEOUT", "20")))
 UPSTREAM_TIMEOUT = max(2.0, float(os.environ.get("GATEWAY_UPSTREAM_TIMEOUT", "10")))
 IDLE_TIMEOUT = max(30.0, float(os.environ.get("GATEWAY_IDLE_TIMEOUT", "900")))
-MAX_INITIAL = min(262144, max(4096, int(os.environ.get("GATEWAY_MAX_INITIAL", "65536"))))
+MAX_INITIAL = min(262144, max(4096, int(os.environ.get("GATEWAY_MAX_INITIAL", "131072"))))
 SEM = asyncio.Semaphore(MAX_CONNECTIONS)
 HTTP = (b"GET ", b"POST ", b"HEAD ", b"PUT ", b"OPTIONS ", b"PATCH ", b"DELETE ", b"PRI * HTTP/2.0")
 logging.basicConfig(level=getattr(logging, os.environ.get("GATEWAY_LOGLEVEL", "INFO").upper(), logging.INFO), format="[gateway] %(levelname)s %(message)s")
@@ -85,10 +85,9 @@ def _parse_client_hello_sni(handshake):
     try:
         if len(handshake) < 4 or handshake[0] != 1: return None
         hs_len = int.from_bytes(handshake[1:4], "big")
-        end = min(len(handshake), 4 + hs_len)
-        p = 4
-        if p + 34 > end: return None
-        p += 34
+        if hs_len < 34 or 4 + hs_len > len(handshake): return None
+        end = 4 + hs_len
+        p = 4 + 34
         if p + 1 > end: return None
         p += 1 + handshake[p]
         if p + 2 > end: return None
@@ -97,7 +96,8 @@ def _parse_client_hello_sni(handshake):
         p += 1 + handshake[p]
         if p + 2 > end: return None
         ext_len = struct.unpack("!H", handshake[p:p+2])[0]; p += 2
-        ext_end = min(end, p + ext_len)
+        if p + ext_len > end: return None
+        ext_end = p + ext_len
         while p + 4 <= ext_end:
             typ, ln = struct.unpack("!HH", handshake[p:p+4]); p += 4
             if p + ln > ext_end: return None
@@ -110,7 +110,7 @@ def _parse_client_hello_sni(handshake):
                     q += 3
                     if q + name_len > stop: return None
                     if name_type == 0:
-                        return handshake[q:q+name_len].decode("idna", "ignore").strip().lower().rstrip(".")
+                        return handshake[q:q+name_len].decode("idna").strip().lower().rstrip(".")
                     q += name_len
             p += ln
     except (IndexError, struct.error, UnicodeError):
@@ -119,23 +119,34 @@ def _parse_client_hello_sni(handshake):
 
 
 def _tls_client_hello(buf):
-    if len(buf) < 5 or buf[0] != 0x16 or buf[1] != 0x03: return False, None
+    """Parse TLS records from a TCP buffer; tolerate TCP fragmentation and
+    handshake messages split across multiple TLS records."""
+    if len(buf) < 5 or buf[0] != 0x16 or buf[1] != 0x03:
+        return False, None
     pos = 0
     handshake = bytearray()
     while pos + 5 <= len(buf):
-        typ = buf[pos]; major = buf[pos+1]; ln = struct.unpack("!H", buf[pos+3:pos+5])[0]
-        if major != 3 or typ not in (20, 21, 22, 23): return False, None
-        if pos + 5 + ln > len(buf): break
-        payload = buf[pos+5:pos+5+ln]
+        typ = buf[pos]
+        major = buf[pos + 1]
+        minor = buf[pos + 2]
+        ln = struct.unpack("!H", buf[pos + 3:pos + 5])[0]
+        if major != 3 or minor not in (0, 1, 2, 3, 4) or typ not in (20, 21, 22, 23):
+            return False, None
+        if pos + 5 + ln > len(buf):
+            break
+        payload = buf[pos + 5:pos + 5 + ln]
         if typ == 22:
             handshake.extend(payload)
             while len(handshake) >= 4:
+                if handshake[0] != 1:
+                    return False, None
                 hs_len = int.from_bytes(handshake[1:4], "big")
                 total = 4 + hs_len
-                if len(handshake) < total: break
-                if handshake[0] == 1:
-                    sni = _parse_client_hello_sni(bytes(handshake[:total]))
-                    if sni: return True, sni
+                if len(handshake) < total:
+                    break
+                sni = _parse_client_hello_sni(bytes(handshake[:total]))
+                if sni:
+                    return True, sni
                 del handshake[:total]
         pos += 5 + ln
     return False, None
@@ -143,13 +154,14 @@ def _tls_client_hello(buf):
 
 def tls_sni(buf):
     complete, sni = _tls_client_hello(buf)
-    if sni: return sni
-    # Last-resort plaintext SNI extraction. SNI is unencrypted in ClientHello;
-    # this also handles unusual ClientHello layouts that the strict parser rejects.
+    if sni:
+        return sni
+    # Last-resort plaintext SNI extraction. The SNI extension is visible in a
+    # TLS ClientHello before the encrypted application-data phase. This is used
+    # only for our two explicitly configured routing names.
     low = bytes(buf).lower()
     for candidate in ROUTES:
-        needle = candidate.encode()
-        if needle in low:
+        if candidate.encode("ascii") in low:
             return candidate
     return None
 
@@ -159,16 +171,23 @@ async def read_initial(reader):
     deadline = asyncio.get_running_loop().time() + INITIAL_TIMEOUT
     while len(buf) < MAX_INITIAL:
         left = max(0.05, deadline - asyncio.get_running_loop().time())
-        try: chunk = await asyncio.wait_for(reader.read(min(8192, MAX_INITIAL-len(buf))), left)
-        except asyncio.TimeoutError: break
-        if not chunk: break
-        buf.extend(chunk); b = bytes(buf)
+        try:
+            chunk = await asyncio.wait_for(reader.read(min(8192, MAX_INITIAL - len(buf))), left)
+        except asyncio.TimeoutError:
+            break
+        if not chunk:
+            break
+        buf.extend(chunk)
+        b = bytes(buf)
         if b.startswith(HTTP):
-            if b"\r\n\r\n" in b or len(b) > 8192: return b
-        elif b[:1] == b"\x16" and len(b) >= 3 and b[1] == 0x03:
+            if b"\r\n\r\n" in b or len(b) > 8192:
+                return b
+        elif len(b) >= 3 and b[0] == 0x16 and b[1] == 0x03:
             complete, sni = _tls_client_hello(b)
-            if complete or sni: return b
-        elif b[:1] != b"\x16": return b
+            if complete or sni:
+                return b
+        elif b[:1] != b"\x16":
+            return b
     return bytes(buf)
 
 
@@ -176,22 +195,31 @@ async def pipe(r, w, direction):
     try:
         while True:
             b = await asyncio.wait_for(r.read(65536), timeout=IDLE_TIMEOUT)
-            if not b: return
-            w.write(b); await w.drain()
-    except asyncio.CancelledError: raise
-    except Exception as exc: log.info("RELAY_ERROR direction=%s error=%s:%s", direction, type(exc).__name__, exc)
+            if not b:
+                return
+            w.write(b)
+            await w.drain()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        log.info("RELAY_ERROR direction=%s error=%s:%s", direction, type(exc).__name__, exc)
 
 
 async def relay(reader, writer, initial, dest, label, sni="-"):
-    up = None; tasks = set()
+    up = None
+    tasks = set()
     try:
         log.info("ROUTE_SELECTED route=%s sni=%s dest=%s:%s initial=%d", label, sni, dest[0], dest[1], len(initial))
         ur, up = await asyncio.wait_for(asyncio.open_connection(*dest), timeout=UPSTREAM_TIMEOUT)
         log.info("UPSTREAM_CONNECT_OK route=%s dest=%s:%s", label, dest[0], dest[1])
         if initial:
-            up.write(initial); await up.drain()
+            up.write(initial)
+            await up.drain()
             log.info("INITIAL_FORWARDED route=%s bytes=%d", label, len(initial))
-        tasks = {asyncio.create_task(pipe(reader, up, "client->upstream")), asyncio.create_task(pipe(ur, writer, "upstream->client"))}
+        tasks = {
+            asyncio.create_task(pipe(reader, up, "client->upstream")),
+            asyncio.create_task(pipe(ur, writer, "upstream->client")),
+        }
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for task in done:
             try: task.result()
@@ -218,50 +246,63 @@ async def write_response(writer, status, body=b"", content_type=b"text/plain; ch
 
 
 async def http(reader, writer, initial):
-    first = initial.split(b"\r\n",1)[0].decode("latin1","ignore"); parts = first.split(" ",2)
-    method = parts[0] if parts else ""; target = parts[1] if len(parts)>1 else ""; path = urllib.parse.urlsplit(target).path
-    if method in ("GET","HEAD") and path in ("/health","/ready"):
-        if path == "/health": body=b"healthy\n"; status=b"200 OK"
+    first = initial.split(b"\r\n", 1)[0].decode("latin1", "ignore")
+    parts = first.split(" ", 2)
+    method = parts[0] if parts else ""
+    target = parts[1] if len(parts) > 1 else ""
+    path = urllib.parse.urlsplit(target).path
+    if method in ("GET", "HEAD") and path in ("/health", "/ready"):
+        if path == "/health":
+            body = b"healthy\n"; status = b"200 OK"
         else:
-            ok, reason=readiness(); body=(b"ready\n" if ok else ("not-ready:"+reason+"\n").encode()); status=b"200 OK" if ok else b"503 Service Unavailable"
-        if method=="HEAD": body=b""
-        await write_response(writer,status,body); return
-    m=re.fullmatch(r"/sub/([A-Za-z0-9_-]{20,128})/?",path)
-    if method in ("GET","HEAD") and m:
-        payload,status=subscription(urllib.parse.unquote(m.group(1)))
-        if payload is not None: await write_response(writer,b"200 OK",b"" if method=="HEAD" else payload)
-        else: await write_response(writer,b"404 Not Found" if status=="TOKEN_INVALID" else b"500 Internal Server Error",(status+"\n").encode())
+            ok, reason = readiness()
+            body = b"ready\n" if ok else ("not-ready:" + reason + "\n").encode()
+            status = b"200 OK" if ok else b"503 Service Unavailable"
+        if method == "HEAD": body = b""
+        await write_response(writer, status, body); return
+    m = re.fullmatch(r"/sub/([A-Za-z0-9_-]{20,128})/?", path)
+    if method in ("GET", "HEAD") and m:
+        payload, status = subscription(urllib.parse.unquote(m.group(1)))
+        if payload is not None:
+            await write_response(writer, b"200 OK", b"" if method == "HEAD" else payload)
+        else:
+            await write_response(writer, b"404 Not Found" if status == "TOKEN_INVALID" else b"500 Internal Server Error", (status + "\n").encode())
         return
-    if method in ("GET","HEAD") and path in ("/","/index.html"):
-        body=SITE.read_bytes(); await write_response(writer,b"200 OK",b"" if method=="HEAD" else body,b"text/html; charset=utf-8"); return
-    await relay(reader,writer,initial,HTTP_DEST,"http-xhttp","-")
+    if method in ("GET", "HEAD") and path in ("/", "/index.html"):
+        body = SITE.read_bytes()
+        await write_response(writer, b"200 OK", b"" if method == "HEAD" else body, b"text/html; charset=utf-8"); return
+    await relay(reader, writer, initial, HTTP_DEST, "http-xhttp", "-")
 
 
 async def handle(reader, writer):
-    peer=writer.get_extra_info("peername")
+    peer = writer.get_extra_info("peername")
     async with SEM:
         try:
-            initial=await read_initial(reader)
+            initial = await read_initial(reader)
             if not initial: return
-            if initial.startswith(HTTP): await http(reader,writer,initial); return
-            if initial[:1]==b"\x16" and len(initial)>=3 and initial[1]==0x03:
-                sni=tls_sni(initial); log.info("TLS_SNI peer=%s sni=%s",peer,sni or "-")
-                route=ROUTES.get(sni or "")
+            if initial.startswith(HTTP):
+                await http(reader, writer, initial); return
+            if initial[:1] == b"\x16" and len(initial) >= 3 and initial[1] == 0x03:
+                sni = tls_sni(initial)
+                log.info("TLS_SNI peer=%s sni=%s initial=%d", peer, sni or "-", len(initial))
+                route = ROUTES.get(sni or "")
                 if route:
-                    await relay(reader,writer,initial,(route[0],route[1]),route[2],sni); return
-                log.warning("ROUTE_REJECT tls_sni=%s peer=%s",sni or "-",peer); return
-            log.warning("ROUTE_REJECT unknown_protocol=0x%s peer=%s",initial[:1].hex() if initial else "-",peer)
-        except Exception as exc: log.warning("ERROR peer=%s error=%s:%s",peer,type(exc).__name__,exc)
+                    await relay(reader, writer, initial, (route[0], route[1]), route[2], sni); return
+                log.warning("ROUTE_REJECT tls_sni=%s peer=%s initial=%d", sni or "-", peer, len(initial)); return
+            log.warning("ROUTE_REJECT unknown_protocol=0x%s peer=%s", initial[:1].hex() if initial else "-", peer)
+        except Exception as exc:
+            log.warning("ERROR peer=%s error=%s:%s", peer, type(exc).__name__, exc)
         finally:
             try: writer.close(); await writer.wait_closed()
             except Exception: pass
 
 
 async def main():
-    server=await asyncio.start_server(handle,"0.0.0.0",PORT,limit=262144)
-    log.warning("GATEWAY_READY=%s max_connections=%s idle_timeout=%ss",PORT,MAX_CONNECTIONS,IDLE_TIMEOUT)
-    log.warning("ROUTES=%s",",".join(f"{k}->{v[1]}" for k,v in ROUTES.items()))
+    server = await asyncio.start_server(handle, "0.0.0.0", PORT, limit=262144)
+    log.warning("GATEWAY_READY=%s max_connections=%s idle_timeout=%ss", PORT, MAX_CONNECTIONS, IDLE_TIMEOUT)
+    log.warning("ROUTES=%s", ",".join(f"{k}->{v[1]}" for k,v in ROUTES.items()))
     await server.serve_forever()
 
 
-if __name__ == "__main__": asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())

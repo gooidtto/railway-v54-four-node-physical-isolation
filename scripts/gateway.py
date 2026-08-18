@@ -34,7 +34,7 @@ SEM = asyncio.Semaphore(MAX_CONNECTIONS)
 HTTP = (b"GET ", b"POST ", b"HEAD ", b"PUT ", b"OPTIONS ", b"PATCH ", b"DELETE ", b"PRI * HTTP/2.0")
 
 logging.basicConfig(
-    level=getattr(logging, os.environ.get("GATEWAY_LOGLEVEL", "WARNING").upper(), logging.WARNING),
+    level=getattr(logging, os.environ.get("GATEWAY_LOGLEVEL", "INFO").upper(), logging.INFO),
     format="[gateway] %(levelname)s %(message)s",
 )
 log = logging.getLogger("gateway")
@@ -102,25 +102,14 @@ def subscription(token):
 
 
 def _tls_client_hello(buf):
-    """Return (complete, sni) for a TLS ClientHello carried in one or more records.
-
-    The previous parser stopped after the first complete TLS record. That is not
-    safe for fragmented ClientHello messages and produced false unknown_sni
-    rejects. This parser reassembles handshake bytes across TLS records until the
-    complete ClientHello is available.
-    """
-    if len(buf) < 5:
+    if len(buf) < 5 or buf[0] != 0x16 or buf[1] != 0x03:
         return False, None
-    if buf[0] != 0x16 or buf[1] != 0x03:
-        return False, None
-
     pos = 0
     handshake = bytearray()
     saw_record = False
     while pos + 5 <= len(buf):
         content_type = buf[pos]
         major = buf[pos + 1]
-        minor = buf[pos + 2]
         record_len = struct.unpack("!H", buf[pos + 3:pos + 5])[0]
         if major != 3 or content_type not in (20, 21, 22, 23):
             return False, None
@@ -130,20 +119,16 @@ def _tls_client_hello(buf):
         payload = buf[pos + 5:pos + 5 + record_len]
         if content_type == 22:
             handshake.extend(payload)
-            if len(handshake) >= 4:
+            while len(handshake) >= 4:
                 hs_type = handshake[0]
                 hs_len = int.from_bytes(handshake[1:4], "big")
+                total = 4 + hs_len
+                if len(handshake) < total:
+                    break
                 if hs_type == 1:
-                    total = 4 + hs_len
-                    if len(handshake) < total:
-                        pos += 5 + record_len
-                        continue
                     return True, _parse_client_hello_sni(bytes(handshake[:total]))
-                return True, None
+                del handshake[:total]
         pos += 5 + record_len
-
-    if saw_record:
-        return False, None
     return False, None
 
 
@@ -226,33 +211,47 @@ async def read_initial(reader):
     return bytes(buf)
 
 
-async def pipe(r, w):
+async def pipe(r, w, direction):
     try:
         while True:
             b = await asyncio.wait_for(r.read(65536), timeout=IDLE_TIMEOUT)
             if not b:
+                log.info("RELAY_EOF direction=%s", direction)
                 return
             w.write(b)
             await w.drain()
-    except (asyncio.TimeoutError, ConnectionError, asyncio.IncompleteReadError):
-        return
+    except asyncio.TimeoutError:
+        log.info("RELAY_IDLE_TIMEOUT direction=%s", direction)
+    except (ConnectionError, asyncio.IncompleteReadError) as exc:
+        log.info("RELAY_CLOSE direction=%s error=%s", direction, type(exc).__name__)
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        log.debug("pipe error: %s", exc)
+        log.info("RELAY_ERROR direction=%s error=%s:%s", direction, type(exc).__name__, exc)
 
 
 async def relay(reader, writer, initial, dest, label, sni="-"):
     up = None
     tasks = set()
     try:
+        log.info("ROUTE_SELECTED route=%s sni=%s dest=%s:%s initial=%d", label, sni, dest[0], dest[1], len(initial))
         ur, up = await asyncio.wait_for(asyncio.open_connection(*dest), timeout=UPSTREAM_TIMEOUT)
-        up.write(initial)
-        await up.drain()
-        log.info("ROUTE=%s sni=%s", label, sni)
+        log.info("UPSTREAM_CONNECT_OK route=%s dest=%s:%s", label, dest[0], dest[1])
+        try:
+            up.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+        try:
+            writer.transport.get_extra_info("socket").setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except Exception:
+            pass
+        if initial:
+            up.write(initial)
+            await up.drain()
+            log.info("INITIAL_FORWARDED route=%s bytes=%d", label, len(initial))
         tasks = {
-            asyncio.create_task(pipe(reader, up)),
-            asyncio.create_task(pipe(ur, writer)),
+            asyncio.create_task(pipe(reader, up, "client->upstream")),
+            asyncio.create_task(pipe(ur, writer, "upstream->client")),
         }
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for task in done:
@@ -264,9 +263,9 @@ async def relay(reader, writer, initial, dest, label, sni="-"):
             task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
     except asyncio.TimeoutError:
-        log.warning("UPSTREAM_TIMEOUT route=%s", label)
+        log.warning("UPSTREAM_TIMEOUT route=%s dest=%s:%s", label, dest[0], dest[1])
     except Exception as exc:
-        log.warning("RELAY_ERROR route=%s error=%s:%s", label, type(exc).__name__, exc)
+        log.warning("RELAY_ERROR route=%s dest=%s:%s error=%s:%s", label, dest[0], dest[1], type(exc).__name__, exc)
     finally:
         for task in tasks:
             if not task.done():
@@ -337,11 +336,15 @@ async def http(reader, writer, initial):
 
 
 async def handle(reader, writer):
+    peer = writer.get_extra_info("peername")
     async with SEM:
         try:
+            log.info("TCP_ACCEPT peer=%s", peer)
             initial = await read_initial(reader)
             if not initial:
+                log.info("TCP_EMPTY peer=%s", peer)
                 return
+            log.info("TCP_INITIAL peer=%s bytes=%d first=%s", peer, len(initial), initial[:5].hex())
             if initial.startswith(HTTP):
                 await http(reader, writer, initial)
                 return
@@ -349,16 +352,17 @@ async def handle(reader, writer):
             tls = initial[:1] == b"\x16" and len(initial) >= 3 and initial[1] == 0x03
             if tls:
                 sni = tls_sni(initial)
+                log.info("TLS_SNI peer=%s sni=%s", peer, sni or "-")
                 route = ROUTES.get(sni or "")
                 if route:
                     await relay(reader, writer, initial, (route[0], route[1]), route[2], sni)
                     return
-                log.warning("ROUTE_REJECT tls_sni=%s", sni or "-")
+                log.warning("ROUTE_REJECT tls_sni=%s peer=%s", sni or "-", peer)
                 return
 
-            log.warning("ROUTE_REJECT unknown_protocol=0x%s", initial[:1].hex() if initial else "-")
+            log.warning("ROUTE_REJECT unknown_protocol=0x%s peer=%s", initial[:1].hex() if initial else "-", peer)
         except Exception as exc:
-            log.warning("ERROR=%s:%s", type(exc).__name__, exc)
+            log.warning("ERROR peer=%s error=%s:%s", peer, type(exc).__name__, exc)
         finally:
             try:
                 writer.close()
@@ -368,7 +372,7 @@ async def handle(reader, writer):
 
 
 async def main():
-    server = await asyncio.start_server(handle, "0.0.0.0", PORT, limit=65536)
+    server = await asyncio.start_server(handle, "0.0.0.0", PORT, limit=262144)
     log.warning("GATEWAY_READY=%s max_connections=%s idle_timeout=%ss", PORT, MAX_CONNECTIONS, IDLE_TIMEOUT)
     log.warning("ROUTES=%s", ",".join(f"{k}->{v[1]}" for k, v in ROUTES.items()))
     try:

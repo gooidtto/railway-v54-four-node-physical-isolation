@@ -1,19 +1,20 @@
 {
-  "release": "fixed-single-8080-router-v1",
-  "architecture": "single-8080-protocol-router",
-  "nodes": 4,
+  "release": "stable-optional-cloudflare-ws-v4",
+  "architecture": "single-8080-router-plus-optional-cloudflare-tunnel",
+  "base_nodes": 3,
+  "max_nodes": 4,
   "application_port": 8080,
   "entries": {
     "443": "xhttp-tls",
-    "tcp-proxy-1": "raw-reality-vision",
-    "tcp-proxy-2": "grpc-reality",
-    "tcp-proxy-3": "ws-tls"
+    "tcp-proxy": "raw-reality-vision + xhttp-reality",
+    "cloudflare": "optional-ws-tls"
   },
   "routing": {
     "http": 10086,
     "raw_reality_sni": 10087,
-    "grpc_reality_sni": 10088,
-    "ws_sni": 10089
+    "xhttp_reality_sni": 10088,
+    "cloudflare_ws": "optional"
   },
-  "source_of_truth": "main"
+  "source_of_truth": "main",
+  "cloudflare_enablement": "CLOUDFLARE_TUNNEL_TOKEN + CLOUDFLARE_TUNNEL_ID + CLOUDFLARE_PUBLIC_HOSTNAME + CLOUDFLARE_ORIGIN_SERVICE + WS_PORT + WS_PATH"
 }

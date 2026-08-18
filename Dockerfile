@@ -2,12 +2,12 @@
 ARG XRAY_VERSION=26.3.27
 ARG CLOUDFLARED_VERSION=2026.7.3
 FROM ghcr.io/xtls/xray-core:${XRAY_VERSION} AS xray
-FROM cloudflare/cloudflared:${CLOUDFLARED_VERSION} AS cloudflared
+FROM cloudflare/cloudflared:${CLOUDFLARE_VERSION} AS cloudflared
 
 FROM python:3.12-alpine3.22
 ARG XRAY_VERSION
-ARG CLOUDFLARED_VERSION
-ENV XRAY_VERSION=${XRAY_VERSION} CLOUDFLARED_VERSION=${CLOUDFLARED_VERSION} PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+ARG CLOUDFLARE_VERSION
+ENV XRAY_VERSION=${XRAY_VERSION} CLOUDFLARE_VERSION=${CLOUDFLARE_VERSION} PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 RUN apk add --no-cache openssl ca-certificates && mkdir -p /etc/xray /data /opt/xray/scripts /opt/xray/config /opt/xray/site
 COPY --from=xray /usr/local/bin/xray /usr/local/bin/xray
 COPY --from=cloudflared /usr/local/bin/cloudflared /usr/local/bin/cloudflared
@@ -35,6 +35,6 @@ ENV BUILD_ID=stable-optional-cloudflare-ws-v4 \
     GATEWAY_MAX_INITIAL=65536 \
     GATEWAY_LOGLEVEL=WARNING
 EXPOSE 8080
-HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=5 CMD python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/ready', timeout=4).read()"
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=5 CMD python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/ready', timeout=8).read()"
 WORKDIR /opt/xray
 ENTRYPOINT ["/opt/xray/scripts/start.sh"]

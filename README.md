@@ -76,6 +76,39 @@ RELEASE=stable-optional-cloudflare-ws-v4
 
 Partial or invalid Cloudflare configuration does not create a fourth node. It is reported through `CLOUDFLARE_VALIDATION` and the base topology remains the supported 3-node configuration when the optional variables are incomplete.
 
+## Railway networking change detection
+
+Every deployment reads the **current** Railway-injected values again:
+
+```text
+RAILWAY_PUBLIC_DOMAIN
+RAILWAY_TCP_PROXY_DOMAIN
+RAILWAY_TCP_PROXY_PORT
+```
+
+The previous `/data/runtime.json` is used only for comparison. It is never used as the source of node addresses.
+
+The runtime reports one of:
+
+```text
+RAILWAY_NETWORKING=initial
+RAILWAY_NETWORKING=unchanged
+RAILWAY_NETWORKING=changed
+```
+
+If Railway replaces or changes the Public Domain or TCP Proxy, the deployment reports `changed` and regenerates the subscription using the **new current Railway values**. If they are unchanged, it reports `unchanged` and regenerates using the same current values.
+
+For a changed networking deployment, the log also records:
+
+```text
+RAILWAY_NETWORKING_PREVIOUS_PUBLIC=...
+RAILWAY_NETWORKING_CURRENT_PUBLIC=...
+RAILWAY_NETWORKING_PREVIOUS_TCP=...
+RAILWAY_NETWORKING_CURRENT_TCP=...
+```
+
+The comparison is diagnostic only. It does not freeze or override Railway networking.
+
 ## Persistent state
 
 Create a Railway Volume mounted at:

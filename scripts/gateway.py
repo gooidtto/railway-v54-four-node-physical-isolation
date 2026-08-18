@@ -104,187 +104,201 @@ def subscription(token):
     return base64.b64encode("\n".join(lines).encode()), "OK"
 
 
-def _parse_client_hello_sni(handshake):
-    """Return SNI from one complete TLS ClientHello, or None if absent/invalid."""
-    data = memoryview(handshake)
-    if len(data) < 4 or data[0] != 1:
-        return None, "not-client-hello"
+def _valid_sni(raw):
+    try:
+        name = raw.decode("ascii").strip().lower().rstrip(".")
+    except UnicodeDecodeError:
+        return None
+    if not name or len(name) > 253:
+        return None
+    if any(ord(c) < 0x21 or ord(c) > 0x7e for c in name):
+        return None
+    return name
 
+
+def _parse_sni_incremental(data):
+    """Extract SNI as soon as its extension is complete.
+
+    The surrounding TLS record and ClientHello may still be incomplete. This
+    is intentional: TCP/TLS fragmentation must not prevent routing, and all
+    bytes already received are later relayed unchanged to Xray.
+    """
+    n = len(data)
+    if n < 4:
+        return None, "handshake-header", False
+    if data[0] != 1:
+        return None, f"first-handshake-type-{data[0]}", True
     hs_len = int.from_bytes(data[1:4], "big")
-    if hs_len != len(data) - 4:
-        return None, "handshake-length"
+    if hs_len > MAX_INITIAL - 4:
+        return None, "handshake-too-large", True
 
-    end = len(data)
     p = 4
-
-    if p + 34 > end:
-        return None, "legacy-version-random"
+    if p + 34 > n:
+        return None, "legacy-version-random", False
     p += 34
 
-    if p + 1 > end:
-        return None, "session-id-length"
+    if p + 1 > n:
+        return None, "session-id-length", False
     session_len = data[p]
     p += 1
-    if p + session_len > end:
-        return None, "session-id"
+    if p + session_len > n:
+        return None, "session-id", False
     p += session_len
 
-    if p + 2 > end:
-        return None, "cipher-suite-length"
+    if p + 2 > n:
+        return None, "cipher-suite-length", False
     cipher_len = struct.unpack("!H", data[p:p + 2])[0]
     p += 2
-    if cipher_len < 2 or cipher_len % 2 or p + cipher_len > end:
-        return None, "cipher-suites"
+    if cipher_len < 2 or cipher_len % 2:
+        return None, "cipher-suites-invalid", True
+    if p + cipher_len > n:
+        return None, "cipher-suites", False
     p += cipher_len
 
-    if p + 1 > end:
-        return None, "compression-length"
+    if p + 1 > n:
+        return None, "compression-length", False
     compression_len = data[p]
     p += 1
-    if p + compression_len > end:
-        return None, "compression-methods"
+    if p + compression_len > n:
+        return None, "compression-methods", False
     p += compression_len
 
-    if p == end:
-        return None, "no-extensions"
-    if p + 2 > end:
-        return None, "extensions-length"
+    if p + 2 > n:
+        return None, "extensions-length", False
     extensions_len = struct.unpack("!H", data[p:p + 2])[0]
     p += 2
-    ext_end = p + extensions_len
-    if ext_end != end:
-        return None, "extensions-boundary"
+    full_ext_end = p + extensions_len
+    if full_ext_end > 4 + hs_len:
+        return None, "extensions-boundary", True
+
+    partial_extensions = full_ext_end > n
+    ext_end = min(full_ext_end, n)
 
     while p < ext_end:
         if p + 4 > ext_end:
-            return None, "extension-header"
+            return None, "extension-header", False
         ext_type, ext_len = struct.unpack("!HH", data[p:p + 4])
         p += 4
         if p + ext_len > ext_end:
-            return None, "extension-length"
+            return None, "extension-body", False
 
         if ext_type == 0:
             if ext_len < 2:
-                return None, "sni-list-length"
+                return None, "sni-list-length", True
             list_len = struct.unpack("!H", data[p:p + 2])[0]
             list_start = p + 2
             list_end = list_start + list_len
             if list_end != p + ext_len:
-                return None, "sni-list-boundary"
-
+                return None, "sni-list-boundary", True
             q = list_start
             while q < list_end:
                 if q + 3 > list_end:
-                    return None, "sni-entry-header"
+                    return None, "sni-entry-header", True
                 name_type = data[q]
                 name_len = struct.unpack("!H", data[q + 1:q + 3])[0]
                 q += 3
                 if q + name_len > list_end:
-                    return None, "sni-entry-length"
-                if name_type == 0 and name_len > 0:
-                    raw_name = bytes(data[q:q + name_len])
-                    try:
-                        name = raw_name.decode("ascii")
-                    except UnicodeDecodeError:
-                        return None, "sni-nonascii"
-                    name = name.strip().lower().rstrip(".")
-                    if not name or len(name) > 253:
-                        return None, "sni-invalid"
-                    if any(ord(c) < 0x21 or ord(c) > 0x7e for c in name):
-                        return None, "sni-invalid-chars"
-                    return name, "ok"
+                    return None, "sni-entry-length", False
+                if name_type == 0 and name_len:
+                    name = _valid_sni(bytes(data[q:q + name_len]))
+                    if not name:
+                        return None, "sni-invalid", True
+                    return name, "ok", True
                 q += name_len
-            return None, "sni-hostname-missing"
+            return None, "sni-hostname-missing", True
 
         p += ext_len
 
-    return None, "sni-extension-missing"
+    if partial_extensions:
+        return None, "extensions", False
+    return None, "sni-extension-missing", True
 
 
-def _tls_client_hello(buf):
-    """Parse a TLS ClientHello from an accumulated TCP stream.
+def _parse_sni_from_hello(hello):
+    data = memoryview(hello)
+    if len(data) < 4 or data[0] != 1:
+        return None, "not-client-hello"
+    hs_len = int.from_bytes(data[1:4], "big")
+    if hs_len != len(data) - 4:
+        return None, "handshake-length"
+    sni, reason, _ = _parse_sni_incremental(data)
+    return sni, reason
 
-    Returns (state, sni, reason, handshake_bytes). State is one of:
-    COMPLETE, INCOMPLETE, INVALID. Only COMPLETE is routable.
+
+def _parse_tls_records(buf):
+    """Parse TLS records and ClientHello incrementally.
+
+    A COMPLETE result means a routable SNI has been obtained. The TLS record
+    or the rest of ClientHello may still be incomplete; that is deliberate.
     """
     data = memoryview(buf)
-    if len(data) < 5:
-        return "INCOMPLETE", None, "record-header", b""
-    if data[0] != 0x16 or data[1] != 0x03:
-        return "INVALID", None, "not-tls-handshake", b""
-
     pos = 0
     handshake = bytearray()
-    max_handshake = MAX_INITIAL
+    saw_record = False
 
     while pos < len(data):
         if len(data) - pos < 5:
-            return "INCOMPLETE", None, "record-header", bytes(handshake)
+            return "INCOMPLETE", None, "record-header", len(handshake), False
 
-        content_type = data[pos]
-        major = data[pos + 1]
-        minor = data[pos + 2]
+        ctype, major, minor = data[pos], data[pos + 1], data[pos + 2]
         record_len = struct.unpack("!H", data[pos + 3:pos + 5])[0]
+        if major != 3 or ctype not in (20, 21, 22, 23):
+            return "INVALID", None, "record-header-invalid", len(handshake), False
 
-        if major != 3 or content_type not in (20, 21, 22, 23):
-            return "INVALID", None, "record-header-invalid", bytes(handshake)
+        end = pos + 5 + record_len
+        available_end = min(end, len(data))
+        saw_record = True
 
-        record_end = pos + 5 + record_len
-        if record_end > len(data):
-            return "INCOMPLETE", None, "record-body", bytes(handshake)
-
-        if content_type == 22:
-            handshake.extend(data[pos + 5:record_end])
-            if len(handshake) > max_handshake:
-                return "INVALID", None, "client-hello-too-large", bytes(handshake)
+        if ctype == 22 and available_end > pos + 5:
+            # Important: inspect the available record body even when the TLS
+            # record itself is split across TCP reads. SNI can be complete
+            # before the record/ClientHello is complete.
+            handshake.extend(data[pos + 5:available_end])
+            if len(handshake) > MAX_INITIAL:
+                return "INVALID", None, "client-hello-too-large", len(handshake), False
 
             if len(handshake) >= 4:
                 hs_type = handshake[0]
                 hs_len = int.from_bytes(handshake[1:4], "big")
-                total = 4 + hs_len
                 if hs_type != 1:
-                    return "INVALID", None, f"first-handshake-type-{hs_type}", bytes(handshake)
-                if total > max_handshake:
-                    return "INVALID", None, "handshake-too-large", bytes(handshake)
-                if len(handshake) < total:
-                    pos = record_end
-                    continue
+                    return "INVALID", None, f"first-handshake-type-{hs_type}", len(handshake), False
+                if 4 + hs_len > MAX_INITIAL:
+                    return "INVALID", None, "handshake-too-large", len(handshake), False
 
-                hello = bytes(handshake[:total])
-                sni, reason = _parse_client_hello_sni(hello)
+                sni, reason, parsed = _parse_sni_incremental(memoryview(handshake))
                 if sni:
-                    return "COMPLETE", sni, "ok", hello
-                return "COMPLETE", None, reason, hello
+                    hello_complete = len(handshake) >= 4 + hs_len
+                    return "COMPLETE", sni, reason, len(handshake), hello_complete
+                if parsed:
+                    return "COMPLETE", None, reason, len(handshake), len(handshake) >= 4 + hs_len
 
-        pos = record_end
+        if end > len(data):
+            return "INCOMPLETE", None, "record-body", len(handshake), False
+        pos = end
 
-    if handshake:
-        return "INCOMPLETE", None, "client-hello-fragment", bytes(handshake)
-    return "INCOMPLETE", None, "no-handshake-data", b""
+    if saw_record:
+        return "INCOMPLETE", None, "client-hello-fragment", len(handshake), False
+    return "INCOMPLETE", None, "no-record", 0, False
 
 
 def tls_sni(buf):
-    state, sni, _reason, _hello = _tls_client_hello(buf)
+    state, sni, _reason, _hlen, _complete = _parse_tls_records(buf)
     return sni if state == "COMPLETE" else None
 
 
 async def read_initial(reader, peer):
     buf = bytearray()
     deadline = asyncio.get_running_loop().time() + INITIAL_TIMEOUT
-    connection_started = asyncio.get_running_loop().time()
-    last_state = None
+    started = asyncio.get_running_loop().time()
+    last_sig = None
 
     while len(buf) < MAX_INITIAL:
         left = max(0.05, deadline - asyncio.get_running_loop().time())
         try:
-            chunk = await asyncio.wait_for(
-                reader.read(min(8192, MAX_INITIAL - len(buf))), left
-            )
+            chunk = await asyncio.wait_for(reader.read(min(8192, MAX_INITIAL - len(buf))), left)
         except asyncio.TimeoutError:
-            log.warning(
-                "TLS_READ_TIMEOUT peer=%s:%s bytes=%d elapsed=%.2fs",
-                peer[0], peer[1], len(buf), asyncio.get_running_loop().time() - connection_started,
-            )
+            log.warning("TLS_READ_TIMEOUT peer=%s:%s bytes=%d elapsed=%.2fs",
+                        peer[0], peer[1], len(buf), asyncio.get_running_loop().time() - started)
             return bytes(buf)
         if not chunk:
             return bytes(buf)
@@ -298,24 +312,24 @@ async def read_initial(reader, peer):
                 return b
             continue
 
-        if b[:1] == b"\x16" and len(b) >= 3 and b[1] == 0x03:
-            state, sni, reason, hello = _tls_client_hello(b)
-            if state != last_state or state == "COMPLETE":
+        if len(b) >= 3 and b[0] == 0x16 and b[1] == 0x03:
+            state, sni, reason, hlen, hello_complete = _parse_tls_records(b)
+            sig = (state, sni, reason, hlen, hello_complete)
+            if sig != last_sig:
                 log.info(
-                    "TLS_PARSE peer=%s:%s state=%s bytes=%d handshake=%d sni=%s reason=%s",
-                    peer[0], peer[1], state, len(b), len(hello), sni or "-", reason,
-                )
-                last_state = state
-            if state == "COMPLETE":
+                    "TLS_PARSE peer=%s:%s state=%s bytes=%d handshake=%d hello_complete=%s sni=%s reason=%s",
+                    peer[0], peer[1], state, len(b), hlen, hello_complete, sni or "-", reason)
+                last_sig = sig
+            # Route as soon as SNI is complete. The buffered bytes are not
+            # modified; Xray receives them followed by all subsequent bytes.
+            if state == "COMPLETE" and sni:
                 return b
             if state == "INVALID":
                 return b
             continue
 
-        log.warning(
-            "UNKNOWN_PROTOCOL peer=%s:%s first=0x%s bytes=%d",
-            peer[0], peer[1], b[:8].hex(), len(b),
-        )
+        log.warning("UNKNOWN_PROTOCOL peer=%s:%s first=0x%s bytes=%d",
+                    peer[0], peer[1], b[:8].hex(), len(b))
         return b
 
     log.warning("INITIAL_BUFFER_LIMIT peer=%s:%s bytes=%d", peer[0], peer[1], len(buf))
@@ -344,10 +358,8 @@ async def relay(reader, writer, initial, dest, label, sni="-"):
     up = None
     tasks = set()
     try:
-        log.info(
-            "UPSTREAM_CONNECT_START route=%s sni=%s dest=%s:%s initial=%d",
-            label, sni, dest[0], dest[1], len(initial),
-        )
+        log.info("UPSTREAM_CONNECT_START route=%s sni=%s dest=%s:%s initial=%d",
+                 label, sni, dest[0], dest[1], len(initial))
         ur, up = await asyncio.wait_for(asyncio.open_connection(*dest), timeout=UPSTREAM_TIMEOUT)
         log.info("UPSTREAM_CONNECT_OK route=%s sni=%s dest=%s:%s", label, sni, dest[0], dest[1])
         up.write(initial)
@@ -371,9 +383,11 @@ async def relay(reader, writer, initial, dest, label, sni="-"):
     except asyncio.TimeoutError:
         log.warning("UPSTREAM_TIMEOUT route=%s sni=%s dest=%s:%s", label, sni, dest[0], dest[1])
     except ConnectionError as exc:
-        log.warning("UPSTREAM_CONNECT_ERROR route=%s sni=%s dest=%s:%s error=%s", label, sni, dest[0], dest[1], exc)
+        log.warning("UPSTREAM_CONNECT_ERROR route=%s sni=%s dest=%s:%s error=%s",
+                    label, sni, dest[0], dest[1], exc)
     except Exception as exc:
-        log.warning("RELAY_ERROR route=%s sni=%s error=%s:%s", label, sni, type(exc).__name__, exc)
+        log.warning("RELAY_ERROR route=%s sni=%s error=%s:%s",
+                    label, sni, type(exc).__name__, exc)
     finally:
         for task in tasks:
             if not task.done():
@@ -410,8 +424,7 @@ async def http(reader, writer, initial):
 
     if method in ("GET", "HEAD") and path in ("/health", "/ready"):
         if path == "/health":
-            body = b"healthy\n"
-            status = b"200 OK"
+            body, status = b"healthy\n", b"200 OK"
         else:
             ok, reason = readiness()
             body = ("ready\n" if ok else "not-ready:" + reason + "\n").encode()
@@ -426,7 +439,7 @@ async def http(reader, writer, initial):
         payload, status = subscription(urllib.parse.unquote(m.group(1)))
         if payload is not None:
             body = b"" if method == "HEAD" else payload
-            await write_response(writer, b"200 OK", body, b"text/plain; charset=utf-8")
+            await write_response(writer, b"200 OK", body)
         else:
             body = (status + "\n").encode()
             code = b"404 Not Found" if status == "TOKEN_INVALID" else b"500 Internal Server Error"
@@ -453,47 +466,39 @@ async def handle(reader, writer):
                 log.info("TCP_EMPTY peer=%s:%s", peer[0], peer[1])
                 return
 
-            log.info(
-                "INITIAL_COMPLETE peer=%s:%s bytes=%d first=0x%s",
-                peer[0], peer[1], len(initial), initial[:8].hex(),
-            )
+            log.info("INITIAL_COMPLETE peer=%s:%s bytes=%d first=0x%s",
+                     peer[0], peer[1], len(initial), initial[:8].hex())
 
             if initial.startswith(HTTP):
                 await http(reader, writer, initial)
                 return
 
-            tls = initial[:1] == b"\x16" and len(initial) >= 3 and initial[1] == 0x03
+            tls = len(initial) >= 3 and initial[:1] == b"\x16" and initial[1] == 0x03
             if tls:
-                state, sni, reason, hello = _tls_client_hello(initial)
-                if state != "COMPLETE":
+                state, sni, reason, hlen, hello_complete = _parse_tls_records(initial)
+                if state != "COMPLETE" or not sni:
                     log.warning(
-                        "TLS_PARSE_FAIL peer=%s:%s state=%s bytes=%d handshake=%d sni=%s reason=%s",
-                        peer[0], peer[1], state, len(initial), len(hello), sni or "-", reason,
-                    )
+                        "TLS_PARSE_FAIL peer=%s:%s state=%s bytes=%d handshake=%d hello_complete=%s sni=%s reason=%s",
+                        peer[0], peer[1], state, len(initial), hlen, hello_complete, sni or "-", reason)
                     return
 
-                log.info(
-                    "TLS_CLIENT_HELLO_COMPLETE peer=%s:%s bytes=%d handshake=%d sni=%s",
-                    peer[0], peer[1], len(initial), len(hello), sni or "-",
-                )
-                route = ROUTES.get(sni or "")
+                log.info("TLS_CLIENT_HELLO_COMPLETE peer=%s:%s bytes=%d handshake=%d hello_complete=%s sni=%s",
+                         peer[0], peer[1], len(initial), hlen, hello_complete, sni)
+                route = ROUTES.get(sni)
                 if route:
-                    log.info(
-                        "ROUTE_SELECTED peer=%s:%s sni=%s route=%s dest=%s:%s",
-                        peer[0], peer[1], sni, route[2], route[0], route[1],
-                    )
-                    await relay(reader, writer, initial, (route[0], route[1]), route[2], sni)
+                    log.info("ROUTE_SELECTED peer=%s:%s sni=%s route=%s dest=%s:%s",
+                             peer[0], peer[1], sni, route[2], route[0], route[1])
+                    await relay(reader, writer, initial, route[:2], route[2], sni)
                     return
-
-                log.warning("ROUTE_REJECT peer=%s:%s tls_sni=%s reason=unknown-sni", peer[0], peer[1], sni or "-")
+                log.warning("ROUTE_REJECT peer=%s:%s tls_sni=%s reason=unknown-sni",
+                            peer[0], peer[1], sni or "-")
                 return
 
-            log.warning(
-                "ROUTE_REJECT peer=%s:%s unknown_protocol=0x%s",
-                peer[0], peer[1], initial[:1].hex() if initial else "-",
-            )
+            log.warning("ROUTE_REJECT peer=%s:%s unknown_protocol=0x%s",
+                        peer[0], peer[1], initial[:1].hex() if initial else "-")
         except Exception as exc:
-            log.warning("ERROR peer=%s:%s type=%s error=%s", peer[0], peer[1], type(exc).__name__, exc)
+            log.warning("ERROR peer=%s:%s type=%s error=%s",
+                        peer[0], peer[1], type(exc).__name__, exc)
         finally:
             try:
                 writer.close()
@@ -504,7 +509,9 @@ async def handle(reader, writer):
 
 async def main():
     server = await asyncio.start_server(handle, "0.0.0.0", PORT, limit=65536)
-    log.warning("GATEWAY_READY=%s max_connections=%s idle_timeout=%ss loglevel=%s", PORT, MAX_CONNECTIONS, IDLE_TIMEOUT, os.environ.get("GATEWAY_LOGLEVEL", "INFO").upper())
+    log.warning("GATEWAY_READY=%s max_connections=%s idle_timeout=%ss loglevel=%s",
+                PORT, MAX_CONNECTIONS, IDLE_TIMEOUT,
+                os.environ.get("GATEWAY_LOGLEVEL", "INFO").upper())
     log.warning("ROUTES=%s", ",".join(f"{k}->{v[1]}" for k, v in ROUTES.items()))
     try:
         await server.serve_forever()

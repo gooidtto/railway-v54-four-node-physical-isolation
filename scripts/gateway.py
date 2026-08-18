@@ -102,98 +102,168 @@ def subscription(token):
 
 
 def _tls_client_hello(buf):
-    """Return (complete, sni) for a TLS ClientHello carried in one or more records.
+    """Parse a TLS ClientHello from a TCP byte stream.
 
-    The previous parser stopped after the first complete TLS record. That is not
-    safe for fragmented ClientHello messages and produced false unknown_sni
-    rejects. This parser reassembles handshake bytes across TLS records until the
-    complete ClientHello is available.
+    The parser is deliberately stream-oriented: a ClientHello handshake may be
+    split across TCP reads and TLS records, and one read may contain multiple
+    records. We only return a hostname after the complete ClientHello handshake
+    has been reconstructed and every relevant length boundary has been checked.
+
+    Return value: (complete, sni). `complete=False` means more bytes may be
+    required; `complete=True, sni=None` means a complete ClientHello was parsed
+    but no usable SNI extension was present.
     """
-    if len(buf) < 5:
+    data = memoryview(buf)
+    if len(data) < 5:
         return False, None
-    if buf[0] != 0x16 or buf[1] != 0x03:
+    if data[0] != 0x16 or data[1] != 0x03:
         return False, None
 
     pos = 0
     handshake = bytearray()
-    saw_record = False
-    while pos + 5 <= len(buf):
-        content_type = buf[pos]
-        major = buf[pos + 1]
-        minor = buf[pos + 2]
-        record_len = struct.unpack("!H", buf[pos + 3:pos + 5])[0]
+    saw_handshake_record = False
+    max_handshake = MAX_INITIAL
+
+    while pos + 5 <= len(data):
+        content_type = data[pos]
+        major = data[pos + 1]
+        minor = data[pos + 2]
+        record_len = struct.unpack("!H", data[pos + 3:pos + 5])[0]
+
+        # TLS record versions used by ClientHello are legacy-compatible 0x03xx.
+        # Reject malformed records, but allow 0x0300..0x0304 and future 0x03xx.
         if major != 3 or content_type not in (20, 21, 22, 23):
+            return True, None
+        record_end = pos + 5 + record_len
+        if record_end > len(data):
             return False, None
-        if pos + 5 + record_len > len(buf):
-            return False, None
-        saw_record = True
-        payload = buf[pos + 5:pos + 5 + record_len]
+
         if content_type == 22:
-            handshake.extend(payload)
-            if len(handshake) >= 4:
+            saw_handshake_record = True
+            handshake.extend(data[pos + 5:record_end])
+            if len(handshake) > max_handshake:
+                return True, None
+
+            # A handshake message header is 1-byte type + 3-byte length.
+            while len(handshake) >= 4:
                 hs_type = handshake[0]
                 hs_len = int.from_bytes(handshake[1:4], "big")
-                if hs_type == 1:
-                    total = 4 + hs_len
-                    if len(handshake) < total:
-                        pos += 5 + record_len
-                        continue
-                    return True, _parse_client_hello_sni(bytes(handshake[:total]))
-                return True, None
-        pos += 5 + record_len
+                total = 4 + hs_len
+                if total > max_handshake:
+                    return True, None
+                if len(handshake) < total:
+                    break
 
-    if saw_record:
+                if hs_type != 1:
+                    # The first handshake message on a new TLS connection should
+                    # be ClientHello. Do not attempt to interpret unrelated data.
+                    return True, None
+
+                hello = bytes(handshake[:total])
+                return True, _parse_client_hello_sni(hello)
+
+        pos = record_end
+
+    if saw_handshake_record:
         return False, None
     return False, None
 
 
 def _parse_client_hello_sni(handshake):
-    if len(handshake) < 4 or handshake[0] != 1:
+    """Strictly parse the SNI extension from one complete ClientHello."""
+    data = memoryview(handshake)
+    if len(data) < 4 or data[0] != 1:
         return None
-    hs_len = int.from_bytes(handshake[1:4], "big")
-    end = min(len(handshake), 4 + hs_len)
+
+    hs_len = int.from_bytes(data[1:4], "big")
+    if hs_len != len(data) - 4:
+        return None
+
+    end = len(data)
     p = 4
+
+    # legacy_version (2) + random (32)
     if p + 34 > end:
         return None
     p += 34
+
+    # session_id
     if p + 1 > end:
         return None
-    session_len = handshake[p]
-    p += 1 + session_len
+    session_len = data[p]
+    p += 1
+    if p + session_len > end:
+        return None
+    p += session_len
+
+    # cipher_suites
     if p + 2 > end:
         return None
-    cipher_len = struct.unpack("!H", handshake[p:p + 2])[0]
-    p += 2 + cipher_len
-    if p + 1 > end:
-        return None
-    compression_len = handshake[p]
-    p += 1 + compression_len
-    if p + 2 > end:
-        return None
-    extensions_len = struct.unpack("!H", handshake[p:p + 2])[0]
+    cipher_len = struct.unpack("!H", data[p:p + 2])[0]
     p += 2
-    ext_end = min(end, p + extensions_len)
+    if cipher_len < 2 or p + cipher_len > end:
+        return None
+    p += cipher_len
+
+    # compression_methods
+    if p + 1 > end:
+        return None
+    compression_len = data[p]
+    p += 1
+    if p + compression_len > end:
+        return None
+    p += compression_len
+
+    # extensions are optional in the wire format, but SNI routing requires them.
+    if p == end:
+        return None
+    if p + 2 > end:
+        return None
+    extensions_len = struct.unpack("!H", data[p:p + 2])[0]
+    p += 2
+    ext_end = p + extensions_len
+    if ext_end != end:
+        return None
+
     while p + 4 <= ext_end:
-        typ, ln = struct.unpack("!HH", handshake[p:p + 4])
+        ext_type, ext_len = struct.unpack("!HH", data[p:p + 4])
         p += 4
-        if p + ln > ext_end:
+        if p + ext_len > ext_end:
             return None
-        if typ == 0 and ln >= 5:
-            q = p + 2
-            stop = p + ln
-            while q + 3 <= stop:
-                name_type = handshake[q]
-                name_len = struct.unpack("!H", handshake[q + 1:q + 3])[0]
-                q += 3
-                if q + name_len > stop:
+
+        if ext_type == 0:  # server_name
+            if ext_len < 2:
+                return None
+            list_len = struct.unpack("!H", data[p:p + 2])[0]
+            list_start = p + 2
+            list_end = list_start + list_len
+            if list_end != p + ext_len:
+                return None
+
+            q = list_start
+            while q < list_end:
+                if q + 3 > list_end:
                     return None
-                if name_type == 0:
+                name_type = data[q]
+                name_len = struct.unpack("!H", data[q + 1:q + 3])[0]
+                q += 3
+                if q + name_len > list_end:
+                    return None
+                if name_type == 0 and name_len > 0:
+                    raw_name = bytes(data[q:q + name_len])
                     try:
-                        return handshake[q:q + name_len].decode("idna").strip().lower().rstrip(".")
-                    except Exception:
-                        return handshake[q:q + name_len].decode("ascii", "ignore").strip().lower().rstrip(".")
+                        name = raw_name.decode("ascii")
+                    except UnicodeDecodeError:
+                        return None
+                    name = name.strip().lower().rstrip(".")
+                    if not name or len(name) > 253 or any(ord(c) < 0x21 or ord(c) > 0x7e for c in name):
+                        return None
+                    return name
                 q += name_len
-        p += ln
+            return None
+
+        p += ext_len
+
     return None
 
 
@@ -209,20 +279,24 @@ async def read_initial(reader):
         try:
             chunk = await asyncio.wait_for(reader.read(min(8192, MAX_INITIAL - len(buf))), left)
         except asyncio.TimeoutError:
+            log.debug("TLS_READ_TIMEOUT bytes=%d", len(buf))
             break
         if not chunk:
             break
         buf.extend(chunk)
         b = bytes(buf)
+
         if b.startswith(HTTP):
             if b"\r\n\r\n" in b or len(b) > 8192:
                 return b
         elif b[:1] == b"\x16" and len(b) >= 3 and b[1] == 0x03:
-            complete, _ = _tls_client_hello(b)
+            complete, sni = _tls_client_hello(b)
             if complete:
+                log.debug("TLS_CLIENT_HELLO_COMPLETE bytes=%d sni=%s", len(b), sni or "-")
                 return b
         elif b[:1] != b"\x16":
             return b
+
     return bytes(buf)
 
 
@@ -249,6 +323,7 @@ async def relay(reader, writer, initial, dest, label, sni="-"):
         ur, up = await asyncio.wait_for(asyncio.open_connection(*dest), timeout=UPSTREAM_TIMEOUT)
         up.write(initial)
         await up.drain()
+        log.info("UPSTREAM_CONNECT route=%s sni=%s dest=%s:%s", label, sni, dest[0], dest[1])
         log.info("ROUTE=%s sni=%s", label, sni)
         tasks = {
             asyncio.create_task(pipe(reader, up)),
@@ -264,9 +339,9 @@ async def relay(reader, writer, initial, dest, label, sni="-"):
             task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
     except asyncio.TimeoutError:
-        log.warning("UPSTREAM_TIMEOUT route=%s", label)
+        log.warning("UPSTREAM_TIMEOUT route=%s sni=%s dest=%s:%s", label, sni, dest[0], dest[1])
     except Exception as exc:
-        log.warning("RELAY_ERROR route=%s error=%s:%s", label, type(exc).__name__, exc)
+        log.warning("RELAY_ERROR route=%s sni=%s error=%s:%s", label, sni, type(exc).__name__, exc)
     finally:
         for task in tasks:
             if not task.done():
@@ -337,18 +412,24 @@ async def http(reader, writer, initial):
 
 
 async def handle(reader, writer):
+    peer = writer.get_extra_info("peername") or ("-", 0)
     async with SEM:
         try:
             initial = await read_initial(reader)
             if not initial:
                 return
+            log.debug("TCP_ACCEPT peer=%s:%s bytes=%d first=0x%s", peer[0], peer[1], len(initial), initial[:8].hex())
             if initial.startswith(HTTP):
                 await http(reader, writer, initial)
                 return
 
             tls = initial[:1] == b"\x16" and len(initial) >= 3 and initial[1] == 0x03
             if tls:
-                sni = tls_sni(initial)
+                complete, sni = _tls_client_hello(initial)
+                if not complete:
+                    log.warning("TLS_PARSE_INCOMPLETE peer=%s:%s bytes=%d", peer[0], peer[1], len(initial))
+                    return
+                log.info("TLS_CLIENT_HELLO_COMPLETE peer=%s:%s bytes=%d sni=%s", peer[0], peer[1], len(initial), sni or "-")
                 route = ROUTES.get(sni or "")
                 if route:
                     await relay(reader, writer, initial, (route[0], route[1]), route[2], sni)

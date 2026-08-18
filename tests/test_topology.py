@@ -1,41 +1,60 @@
 from pathlib import Path
 
 
-def test_single_8080_four_node_topology():
-    start = Path("scripts/start.sh").read_text()
-    generate = Path("scripts/generate.py").read_text()
-    gateway = Path("scripts/gateway.py").read_text()
-    docker = Path("Dockerfile").read_text()
-
-    assert 'GATEWAY_PORT=8080' in start
-    assert 'TCP targets must be 8081:8082:8083' not in start
-    assert 'GATEWAY_PORTS=8080,8081,8082,8083' not in start
-    assert 'TARGET_PORT=8080' in start
-    assert 'NODE_COUNT=4' in generate
-    assert 'APP_PORT=8080' in generate
-    assert 'RAILWAY_TCP_PROXY_2_DOMAIN' in generate
-    assert 'RAILWAY_TCP_PROXY_3_DOMAIN' in generate
-    assert 'REALITY_RAW_SNI' in generate
-    assert 'REALITY_GRPC_SNI' in generate
-    assert 'NODES=4' in start
-    assert 'SNI' in gateway
-    assert 'tls_sni' in gateway
-    assert '8081' not in docker and '8082' not in docker and '8083' not in docker
-    assert 'EXPOSE 8080' in docker
+ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_single_listener_routes_four_nodes():
-    gateway = Path("scripts/gateway.py").read_text()
-    assert 'server=await asyncio.start_server(handle,"0.0.0.0",PORT' in gateway
-    assert 'REALITY_DEST=("127.0.0.1",10087)' in gateway
-    assert 'GRPC_DEST=("127.0.0.1",10088)' in gateway
-    assert 'WS_DEST=("127.0.0.1",10089)' in gateway
-    assert 'if sni==RAW_SNI' in gateway
-    assert 'if sni==GRPC_SNI' in gateway
-    assert 'if WS_SNI and sni==WS_SNI' in gateway
+def read(path):
+    return (ROOT / path).read_text()
 
 
-def test_subscription_is_exactly_four():
-    generate = Path("scripts/generate.py").read_text()
-    assert 'if len(lines)!=NODE_COUNT' in generate
-    assert '"node_count":4' in generate
+def test_single_8080_optional_four_node_topology():
+    start = read("scripts/start.sh")
+    generate = read("scripts/generate.py")
+    gateway = read("scripts/gateway.py")
+    docker = read("Dockerfile")
+    railway = read("railway.toml")
+
+    assert "GATEWAY_PORT=8080" in start
+    assert "TARGET_PORT=8080" in start
+    assert "APP_PORT = 8080" in generate or "APP_PORT=8080" in generate
+    assert "10086" in generate and "10087" in generate and "10088" in generate
+    assert '"count": NODE_COUNT' in generate
+    assert "NODES=$EXPECTED" in start
+    assert "8081" not in docker and "8082" not in docker and "8083" not in docker
+    assert "EXPOSE 8080" in docker
+    assert 'healthcheckPath = "/ready"' in railway
+    assert "healthcheckTimeout = 300" in railway
+
+
+def test_gateway_has_deep_readiness_and_limits():
+    gateway = read("scripts/gateway.py")
+    assert "asyncio.start_server(handle, \"0.0.0.0\", PORT" in gateway
+    assert "GATEWAY_MAX_CONNECTIONS" in gateway
+    assert "GATEWAY_UPSTREAM_TIMEOUT" in gateway
+    assert "GATEWAY_IDLE_TIMEOUT" in gateway
+    assert "def readiness():" in gateway
+    assert 'path in ("/health", "/ready")' in gateway
+    assert "local_port_ready(10086)" in gateway
+    assert "local_port_ready(10087)" in gateway
+    assert "local_port_ready(10088)" in gateway
+    assert "cloudflare_ready()" in gateway
+    assert "asyncio.wait_for(asyncio.open_connection" in gateway
+
+
+def test_subscription_invariant_supports_three_or_four_nodes():
+    generate = read("scripts/generate.py")
+    start = read("scripts/start.sh")
+    gateway = read("scripts/gateway.py")
+    assert "NODE_COUNT = len(lines)" in generate
+    assert "NODE_COUNT not in (3, 4)" in generate
+    assert "expected not in (3, 4)" in gateway
+    assert "case \"$EXPECTED\" in" in start
+    assert "3|4)" in start
+
+
+def test_healthcheck_uses_ready_endpoint():
+    docker = read("Dockerfile")
+    railway = read("railway.toml")
+    assert 'urlopen(\'http://127.0.0.1:8080/ready\'' in docker
+    assert 'healthcheckPath = "/ready"' in railway

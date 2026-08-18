@@ -16,6 +16,7 @@ COPY config/ /opt/xray/config/
 COPY site/ /opt/xray/site/
 RUN chmod 0755 /usr/local/bin/xray /usr/local/bin/cloudflared /opt/xray/scripts/*.sh /opt/xray/scripts/*.py && chmod 0644 /opt/xray/config/* /opt/xray/site/*
 ENV BUILD_ID=stable-optional-cloudflare-ws-v4 \
+    SOURCE_BUILD=main-hardened-v4 \
     PORT=8080 \
     GATEWAY_PORT=8080 \
     XRAY_CONFIG=/etc/xray/config.json \

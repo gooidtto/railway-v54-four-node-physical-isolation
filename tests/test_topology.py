@@ -55,17 +55,21 @@ def test_subscription_invariant_supports_three_or_four_nodes():
 
 def test_cloudflare_variables_enable_only_node_four():
     generate = read("scripts/generate.py")
-    assert "# Base deployment = 3 nodes. A complete Cloudflare variable set enables node 4." in generate
-    assert "CF_ENABLED = bool(CF_TOKEN and CF_HOST and CF_PORT_RAW and CF_PATH)" in generate
+    assert "# Base deployment = 3 nodes. Node 4 is enabled only when the complete," in generate
+    assert "CF_CONFIG_PRESENT = any(CF_VARIABLES)" in generate
+    assert "CF_ENABLED = all(CF_VARIABLES)" in generate
     assert '"04": "cloudflare-ws-tls"' in generate
     assert '"build": "stable-optional-cloudflare-ws-v4"' in generate
     assert 'print("RELEASE=stable-optional-cloudflare-ws-v4"' in generate
-    assert "CLOUDFLARE_TUNNEL_TOKEN" in generate
-    assert "CLOUDFLARE_TUNNEL_ID" in generate
-    assert "CLOUDFLARE_PUBLIC_HOSTNAME" in generate
-    assert "CLOUDFLARE_ORIGIN_SERVICE" in generate
-    assert "WS_PORT" in generate
-    assert "WS_PATH" in generate
+    for name in (
+        "CLOUDFLARE_TUNNEL_TOKEN",
+        "CLOUDFLARE_TUNNEL_ID",
+        "CLOUDFLARE_PUBLIC_HOSTNAME",
+        "CLOUDFLARE_ORIGIN_SERVICE",
+        "WS_PORT",
+        "WS_PATH",
+    ):
+        assert name in generate
 
 
 def test_healthcheck_uses_ready_endpoint():

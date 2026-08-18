@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 umask 077
-BUILD_ID="stable-optional-cloudflare-ws-v2"
+BUILD_ID="${BUILD_ID:-stable-optional-cloudflare-ws-v4}"
 D="${RAILWAY_VOLUME_MOUNT_PATH:-${DATA_DIR:-/data}}"
 C="${XRAY_CONFIG:-${D}/config.json}"
 mkdir -p "$D" "$(dirname "$C")"

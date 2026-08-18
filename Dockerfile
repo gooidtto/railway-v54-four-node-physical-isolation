@@ -2,12 +2,12 @@
 ARG XRAY_VERSION=26.3.27
 ARG CLOUDFLARED_VERSION=2026.7.3
 FROM ghcr.io/xtls/xray-core:${XRAY_VERSION} AS xray
-FROM cloudflare/cloudflared:${CLOUDFLARE_VERSION} AS cloudflared
+FROM cloudflare/cloudflared:${CLOUDFLARED_VERSION} AS cloudflared
 
 FROM python:3.12-alpine3.22
 ARG XRAY_VERSION
-ARG CLOUDFLARE_VERSION
-ENV XRAY_VERSION=${XRAY_VERSION} CLOUDFLARE_VERSION=${CLOUDFLARE_VERSION} PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+ARG CLOUDFLARED_VERSION
+ENV XRAY_VERSION=${XRAY_VERSION} CLOUDFLARED_VERSION=${CLOUDFLARED_VERSION} PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 RUN apk add --no-cache openssl ca-certificates && mkdir -p /etc/xray /data /opt/xray/scripts /opt/xray/config /opt/xray/site
 COPY --from=xray /usr/local/bin/xray /usr/local/bin/xray
 COPY --from=cloudflared /usr/local/bin/cloudflared /usr/local/bin/cloudflared

@@ -72,6 +72,21 @@ def test_cloudflare_variables_enable_only_node_four():
         assert name in generate
 
 
+def test_railway_networking_is_runtime_derived_and_not_hard_coded():
+    start = read("scripts/start.sh")
+    generate = read("scripts/generate.py")
+    assert 'PUBLIC_DOMAIN="${RAILWAY_PUBLIC_DOMAIN:-}"' in start
+    assert 'TCP_HOST="${RAILWAY_TCP_PROXY_DOMAIN:-}"' in start
+    assert 'TCP_PORT="${RAILWAY_TCP_PROXY_PORT:-}"' in start
+    assert "RAILWAY_PUBLIC_DOMAIN" in generate
+    assert "RAILWAY_TCP_PROXY_DOMAIN" in generate
+    assert "RAILWAY_TCP_PROXY_PORT" in generate
+    assert "RAILWAY_NETWORKING=" in start
+    assert "RAILWAY_NETWORKING=initial" in start
+    assert "RAILWAY_NETWORKING=unchanged" in start
+    assert "RAILWAY_NETWORKING=changed" in start
+
+
 def test_healthcheck_uses_ready_endpoint():
     docker = read("Dockerfile")
     railway = read("railway.toml")

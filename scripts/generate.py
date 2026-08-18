@@ -51,11 +51,16 @@ CF_PORT_RAW = env_first("WS_PORT", "CLOUDFLARE_WS_PORT", "CF_WS_PORT")
 CF_PATH = env_first("WS_PATH", "CLOUDFLARE_WS_PATH", "CF_WS_PATH")
 CF_ID = env_first("CLOUDFLARE_TUNNEL_ID", "CF_TUNNEL_ID", "TUNNEL_ID")
 
-# Base deployment = 3 nodes. A complete Cloudflare variable set enables node 4.
-CF_ENABLED = bool(CF_TOKEN and CF_HOST and CF_PORT_RAW and CF_PATH)
+# Base deployment = 3 nodes. Node 4 is enabled only when the complete,
+# explicit six-variable Cloudflare configuration is present.
+CF_VARIABLES = (CF_TOKEN, CF_ID, CF_HOST, CF_ORIGIN_RAW, CF_PORT_RAW, CF_PATH)
+CF_CONFIG_PRESENT = any(CF_VARIABLES)
+CF_ENABLED = all(CF_VARIABLES)
 CF_PORT = None
 CF_INVALID_REASON = ""
 CF_ORIGIN = ""
+if CF_CONFIG_PRESENT and not CF_ENABLED:
+    CF_INVALID_REASON = "incomplete Cloudflare variable set; node 4 disabled"
 
 if CF_ENABLED:
     try:

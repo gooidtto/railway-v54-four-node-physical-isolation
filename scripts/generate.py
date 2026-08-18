@@ -51,9 +51,7 @@ CF_PORT_RAW = env_first("WS_PORT", "CLOUDFLARE_WS_PORT", "CF_WS_PORT")
 CF_PATH = env_first("WS_PATH", "CLOUDFLARE_WS_PATH", "CF_WS_PATH")
 CF_ID = env_first("CLOUDFLARE_TUNNEL_ID", "CF_TUNNEL_ID", "TUNNEL_ID")
 
-# Node 4 is optional: the base Railway deployment is exactly three nodes.
-# Supplying the complete Cloudflare variable set upgrades the generated
-# topology to four nodes; partial configuration is reported as disabled.
+# Base deployment = 3 nodes. A complete Cloudflare variable set enables node 4.
 CF_ENABLED = bool(CF_TOKEN and CF_HOST and CF_PORT_RAW and CF_PATH)
 CF_PORT = None
 CF_INVALID_REASON = ""
@@ -155,7 +153,7 @@ if CF_ENABLED:
 
 config = {
     "log": {"loglevel": os.environ.get("XRAY_LOGLEVEL", "warning")},
-    "policy": {"levels": {"0": {"handshake": 8, "connIdle": 900, "uplinkOnly": 2, "downlinkOnly": 5}},
+    "policy": {"levels": {"0": {"handshake": 8, "connIdle": 900, "uplinkOnly": 2, "downlinkOnly": 5}}},
     "inbounds": inbounds,
     "outbounds": [{"tag": "direct", "protocol": "freedom"}, {"tag": "block", "protocol": "blackhole"}],
 }

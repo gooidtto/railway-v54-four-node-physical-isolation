@@ -15,7 +15,7 @@ COPY scripts/ /opt/xray/scripts/
 COPY config/ /opt/xray/config/
 COPY site/ /opt/xray/site/
 RUN chmod 0755 /usr/local/bin/xray /usr/local/bin/cloudflared /opt/xray/scripts/*.sh /opt/xray/scripts/*.py && chmod 0644 /opt/xray/config/* /opt/xray/site/*
-ENV BUILD_ID=stable-optional-cloudflare-ws \
+ENV BUILD_ID=stable-optional-cloudflare-ws-v4 \
     PORT=8080 \
     GATEWAY_PORT=8080 \
     XRAY_CONFIG=/etc/xray/config.json \
@@ -27,8 +27,14 @@ ENV BUILD_ID=stable-optional-cloudflare-ws \
     REALITY_XHTTP_TARGET=www.apple.com:443 \
     XHTTP_PATH=/xhttp \
     READY_TIMEOUT=90 \
-    CLOUDFLARE_READY_TIMEOUT=45
+    CLOUDFLARE_READY_TIMEOUT=45 \
+    GATEWAY_MAX_CONNECTIONS=512 \
+    GATEWAY_READ_TIMEOUT=15 \
+    GATEWAY_UPSTREAM_TIMEOUT=10 \
+    GATEWAY_IDLE_TIMEOUT=900 \
+    GATEWAY_MAX_INITIAL=65536 \
+    GATEWAY_LOGLEVEL=WARNING
 EXPOSE 8080
-HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=5 CMD python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/ready', timeout=3).read()"
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=5 CMD python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/ready', timeout=4).read()"
 WORKDIR /opt/xray
 ENTRYPOINT ["/opt/xray/scripts/start.sh"]

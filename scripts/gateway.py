@@ -119,8 +119,7 @@ def _parse_client_hello_sni(handshake):
 
 
 def _tls_client_hello(buf):
-    """Parse TLS records from a TCP buffer; tolerate TCP fragmentation and
-    handshake messages split across multiple TLS records."""
+    """Parse TLS records; tolerate TCP fragmentation and handshake messages split across records."""
     if len(buf) < 5 or buf[0] != 0x16 or buf[1] != 0x03:
         return False, None
     pos = 0
@@ -156,9 +155,8 @@ def tls_sni(buf):
     complete, sni = _tls_client_hello(buf)
     if sni:
         return sni
-    # Last-resort plaintext SNI extraction. The SNI extension is visible in a
-    # TLS ClientHello before the encrypted application-data phase. This is used
-    # only for our two explicitly configured routing names.
+    # Last-resort extraction for the two explicit routing names. This also
+    # works while the TLS ClientHello is still fragmented across TCP reads.
     low = bytes(buf).lower()
     for candidate in ROUTES:
         if candidate.encode("ascii") in low:
@@ -183,8 +181,15 @@ async def read_initial(reader):
             if b"\r\n\r\n" in b or len(b) > 8192:
                 return b
         elif len(b) >= 3 and b[0] == 0x16 and b[1] == 0x03:
+            # Do the explicit SNI scan on every read, not only after a whole
+            # ClientHello has been reassembled. Railway TCP Proxy may fragment
+            # the ClientHello at arbitrary TCP boundaries.
             complete, sni = _tls_client_hello(b)
             if complete or sni:
+                return b
+            early_sni = tls_sni(b)
+            if early_sni:
+                log.warning("TLS_SNI_EARLY sni=%s initial=%d", early_sni, len(b))
                 return b
         elif b[:1] != b"\x16":
             return b
@@ -202,20 +207,20 @@ async def pipe(r, w, direction):
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        log.info("RELAY_ERROR direction=%s error=%s:%s", direction, type(exc).__name__, exc)
+        log.warning("RELAY_ERROR direction=%s error=%s:%s", direction, type(exc).__name__, exc)
 
 
 async def relay(reader, writer, initial, dest, label, sni="-"):
     up = None
     tasks = set()
     try:
-        log.info("ROUTE_SELECTED route=%s sni=%s dest=%s:%s initial=%d", label, sni, dest[0], dest[1], len(initial))
+        log.warning("ROUTE_SELECTED route=%s sni=%s dest=%s:%s initial=%d", label, sni, dest[0], dest[1], len(initial))
         ur, up = await asyncio.wait_for(asyncio.open_connection(*dest), timeout=UPSTREAM_TIMEOUT)
-        log.info("UPSTREAM_CONNECT_OK route=%s dest=%s:%s", label, dest[0], dest[1])
+        log.warning("UPSTREAM_CONNECT_OK route=%s dest=%s:%s", label, dest[0], dest[1])
         if initial:
             up.write(initial)
             await up.drain()
-            log.info("INITIAL_FORWARDED route=%s bytes=%d", label, len(initial))
+            log.warning("INITIAL_FORWARDED route=%s bytes=%d", label, len(initial))
         tasks = {
             asyncio.create_task(pipe(reader, up, "client->upstream")),
             asyncio.create_task(pipe(ur, writer, "upstream->client")),
@@ -284,7 +289,7 @@ async def handle(reader, writer):
                 await http(reader, writer, initial); return
             if initial[:1] == b"\x16" and len(initial) >= 3 and initial[1] == 0x03:
                 sni = tls_sni(initial)
-                log.info("TLS_SNI peer=%s sni=%s initial=%d", peer, sni or "-", len(initial))
+                log.warning("TLS_SNI peer=%s sni=%s initial=%d", peer, sni or "-", len(initial))
                 route = ROUTES.get(sni or "")
                 if route:
                     await relay(reader, writer, initial, (route[0], route[1]), route[2], sni); return

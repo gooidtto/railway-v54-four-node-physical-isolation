@@ -1,7 +1,10 @@
 #!/bin/sh
 set -eu
 umask 077
-BUILD_ID="${BUILD_ID:-stable-optional-cloudflare-ws-v4}"
+# Release identity is immutable at runtime. Do not inherit a stale Railway
+# environment variable such as BUILD_ID=v3 over the image's v4 identity.
+BUILD_ID="stable-optional-cloudflare-ws-v4"
+SOURCE_BUILD="main-hardened-v4"
 D="${RAILWAY_VOLUME_MOUNT_PATH:-${DATA_DIR:-/data}}"
 C="${XRAY_CONFIG:-${D}/config.json}"
 mkdir -p "$D" "$(dirname "$C")"
@@ -54,7 +57,7 @@ else
   write_secret "$TOKEN_FILE" "$TOKEN"
 fi
 
-# Normalize Cloudflare variables once.  The generator then freezes the
+# Normalize Cloudflare variables once. The generator then freezes the
 # resulting state into /data/runtime.json; no later process re-evaluates ENV.
 CF_TOKEN="${CLOUDFLARE_TUNNEL_TOKEN:-${CF_TUNNEL_TOKEN:-${TUNNEL_TOKEN:-}}}"
 CF_ID="${CLOUDFLARE_TUNNEL_ID:-${CF_TUNNEL_ID:-${TUNNEL_ID:-}}}"
@@ -134,6 +137,7 @@ if [ "$CF_ENABLED" = 1 ]; then
   [ -n "$CF_TOKEN" ] || { echo "FATAL: runtime state says Cloudflare enabled but tunnel token is unavailable" >&2; exit 1; }
 fi
 
+echo "SOURCE_BUILD=$SOURCE_BUILD"
 echo "RUNTIME_STATE=$RUNTIME"
 echo "RUNTIME_FINGERPRINT=$FINGERPRINT"
 echo "CLOUDFLARE_STATE=$([ "$CF_ENABLED" = 1 ] && echo enabled || echo disabled)"

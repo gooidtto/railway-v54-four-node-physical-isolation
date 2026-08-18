@@ -58,3 +58,14 @@ def test_healthcheck_uses_ready_endpoint():
     railway = read("railway.toml")
     assert 'urlopen(\'http://127.0.0.1:8080/ready\'' in docker
     assert 'healthcheckPath = "/ready"' in railway
+
+
+def test_gateway_tls_parser_handles_fragmented_clienthello():
+    gateway = read("scripts/gateway.py")
+    assert "def _tls_client_hello(buf):" in gateway
+    assert "reassembles handshake bytes across TLS records" in gateway
+    assert "def _parse_client_hello_sni(handshake):" in gateway
+    assert "strip().lower().rstrip(\".\")" in gateway
+    assert 'ROUTE_REJECT tls_sni=%s' in gateway
+    assert 'ROUTE_REJECT unknown_protocol=0x%s' in gateway
+    assert 'len(b) >= 5 + struct.unpack("!H", b[3:5])[0]' not in gateway

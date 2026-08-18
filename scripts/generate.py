@@ -17,8 +17,13 @@ PUBLIC_KEY = os.environ["PUBLIC_KEY"].strip()
 PUBLIC_DOMAIN = os.environ["PUBLIC_DOMAIN"].strip()
 APP_PORT = 8080
 
+# Railway Networking is runtime state, not persistent application state.
+# These three variables are the ONLY authoritative source for node endpoints
+# on every deployment. Values in /data are never used to generate endpoints.
 TCP_HOST = (os.environ.get("RAILWAY_TCP_PROXY_DOMAIN") or "").strip()
 TCP_PORT_RAW = (os.environ.get("RAILWAY_TCP_PROXY_PORT") or "").strip()
+if not PUBLIC_DOMAIN:
+    raise SystemExit("FATAL: RAILWAY_PUBLIC_DOMAIN/PUBLIC_DOMAIN required")
 if not TCP_HOST or not TCP_PORT_RAW:
     raise SystemExit("FATAL: RAILWAY_TCP_PROXY_DOMAIN/PORT required")
 try:
@@ -199,9 +204,9 @@ NODE_COUNT = len(lines)
 if NODE_COUNT not in (3, 4):
     raise SystemExit(f"FATAL: invalid node count: {NODE_COUNT}")
 
-# Railway Public Networking is intentionally not persisted as the source of
-# truth. Compare the previous runtime only for diagnostics, then always use
-# the current deployment-injected values above to generate the new nodes.
+# /data/runtime.json is used only as a previous snapshot for diagnostics.
+# It is NEVER an input to node generation. The current Railway-injected
+# environment above remains authoritative even when Networking changes.
 previous_runtime = {}
 previous_runtime_file = D / "runtime.json"
 if previous_runtime_file.is_file():
@@ -224,7 +229,7 @@ else:
     networking_state = "changed"
 
 runtime = {
-    "schema": 22,
+    "schema": 23,
     "build": "stable-optional-cloudflare-ws-v4",
     "architecture": "single-8080-router-plus-optional-cloudflare-tunnel",
     "cloudflare": {
@@ -251,6 +256,8 @@ runtime = {
     "public_domain": PUBLIC_DOMAIN,
     "tcp_proxy": {"domain": TCP_HOST, "port": TCP_PORT, "application_port": APP_PORT},
     "railway_networking": {
+        "source": "current-deployment-environment",
+        "authoritative": True,
         "state": networking_state,
         "previous_public_domain": previous_public,
         "current_public_domain": PUBLIC_DOMAIN,
@@ -272,13 +279,15 @@ runtime["fingerprint"] = hashlib.sha256(json.dumps(runtime, sort_keys=True, sepa
 os.replace(D / "subscription.txt.tmp", D / "subscription.txt")
 
 manifest = {
-    "schema": 22,
+    "schema": 23,
     "build": "stable-optional-cloudflare-ws-v4",
     "node_count": NODE_COUNT,
     "application_port": APP_PORT,
     "cloudflare_ws_enabled": CF_ENABLED,
     "distribution": runtime["nodes"]["distribution"],
     "runtime_fingerprint": runtime["fingerprint"],
+    "railway_networking_source": "current-deployment-environment",
+    "railway_networking_authoritative": True,
     "railway_networking_state": networking_state,
 }
 (D / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
@@ -286,7 +295,11 @@ manifest = {
 print("RELEASE=stable-optional-cloudflare-ws-v4", flush=True)
 print("RUNTIME_STATE=/data/runtime.json", flush=True)
 print(f"RUNTIME_FINGERPRINT={runtime['fingerprint']}", flush=True)
+print("RAILWAY_NETWORKING_SOURCE=current-deployment-environment", flush=True)
+print("RAILWAY_NETWORKING_AUTHORITATIVE=true", flush=True)
 print(f"RAILWAY_NETWORKING={networking_state}", flush=True)
+print(f"RAILWAY_CURRENT_PUBLIC={PUBLIC_DOMAIN}", flush=True)
+print(f"RAILWAY_CURRENT_TCP={current_tcp}", flush=True)
 if networking_state == "changed":
     print(f"RAILWAY_NETWORKING_PREVIOUS_PUBLIC={previous_public or 'missing'}", flush=True)
     print(f"RAILWAY_NETWORKING_CURRENT_PUBLIC={PUBLIC_DOMAIN}", flush=True)

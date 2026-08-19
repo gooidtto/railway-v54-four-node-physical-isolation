@@ -1,0 +1,19 @@
+{
+  "release": "railway-production-v5",
+  "baseline_commit": "6afe981f6063e8c7f0db4b7791dcd9b81808fa37",
+  "node_mode": "4-required",
+  "architecture": "single-8080-router-plus-required-cloudflare-tunnel",
+  "nodes": [
+    "domain-xhttp-tls",
+    "raw-reality-vision",
+    "xhttp-reality",
+    "cloudflare-ws-tls"
+  ],
+  "invariants": [
+    "uuid-match",
+    "subscription-count-match",
+    "railway-networking-current-environment",
+    "fragmented-clienthello-routing",
+    "cloudflare-ready"
+  ]
+}

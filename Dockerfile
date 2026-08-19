@@ -17,7 +17,8 @@ COPY site/ /opt/xray/site/
 RUN chmod 0755 /usr/local/bin/xray /usr/local/bin/cloudflared /opt/xray/scripts/*.sh /opt/xray/scripts/*.py && chmod 0644 /opt/xray/config/* /opt/xray/site/*
 ENV BUILD_ID=railway-production-v5 \
     SOURCE_BUILD=6afe981f6063e8c7f0db4b7791dcd9b81808fa37 \
-    NODE_MODE=4 \
+    NODE_MODE=auto \
+    EXPECTED_NODES=auto \
     PORT=8080 \
     GATEWAY_PORT=8080 \
     XRAY_CONFIG=/etc/xray/config.json \

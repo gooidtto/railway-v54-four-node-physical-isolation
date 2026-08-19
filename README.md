@@ -1,55 +1,31 @@
-# Railway single-8080 deployment
+# Railway Xray Gateway
 
-This repository is designed for a fresh Railway account and supports a staged deployment flow.
+A single-service Railway deployment for an Xray gateway with persistent runtime state and an optional Cloudflare WebSocket node.
 
-## Deployment model
+## Architecture
 
-- One Railway service.
-- One application port: `8080`.
-- One persistent Volume mounted at `/data`.
-- One generated Public Domain.
-- One Railway TCP Proxy targeting internal port `8080`.
-- One replica when a Volume is attached.
-- Base topology: **3 nodes**.
-- Optional Cloudflare Tunnel: **4th node**.
+- One Railway service, internal port `8080`
+- One persistent Volume mounted at `/data`
+- One Railway Public Domain + TCP Proxy
+- One replica when using the Volume
+- Base topology: **3 nodes**
+- Optional Cloudflare Tunnel: **4th node**
+- Health endpoint: `GET /ready`
 
-The service derives its Railway public domain, TCP proxy host/port, and volume path from Railway-provided environment variables. Do not hard-code account-specific Railway domains or proxy ports in the repository.
+Railway-provided networking values are read at runtime; domains and proxy ports are never hard-coded.
 
-## Fresh-account deployment sequence
+## Deploy
 
-### Phase 1 — initial deployment
+1. Deploy the repository from the `main` branch.
+2. Create a Railway Volume at `/data`.
+3. Create a Public Domain and a TCP Proxy targeting internal port `8080`.
+4. Redeploy after networking is available.
 
-1. Connect this repository to a new Railway project.
-2. Select the `main` branch.
-3. Deploy once with the new service before manually creating Public Networking.
-4. The first deployment may fail because `RAILWAY_PUBLIC_DOMAIN`, `RAILWAY_TCP_PROXY_DOMAIN`, and `RAILWAY_TCP_PROXY_PORT` are not available until networking is configured.
+The base deployment generates **3 nodes**. Persistent state under `/data` keeps the generated identity and subscription state stable across redeployments.
 
-This failure is expected for the staged setup; it is not a configuration to bypass by hard-coding a domain or proxy port.
+### Optional fourth node
 
-### Phase 2 — create Railway networking
-
-In the service's **Public Networking** settings, manually create:
-
-- **one Public Domain**
-- **one TCP Proxy** whose target/internal port is **8080**
-
-Then redeploy `main`.
-
-With those two Railway networking resources present and no Cloudflare variables configured, the generator produces exactly **3 subscription nodes**.
-
-Expected runtime markers:
-
-```text
-SUBSCRIPTION_INVARIANT=3
-SUBSCRIPTION_COUNT=3
-NODES=3
-CLOUDFLARE_WS=disabled
-RELEASE=stable-optional-cloudflare-ws-v4
-```
-
-### Phase 3 — optional fourth node
-
-To enable the fourth node, add the complete Cloudflare variable set to the Railway service:
+Set the complete Cloudflare configuration:
 
 ```text
 CLOUDFLARE_TUNNEL_TOKEN
@@ -60,88 +36,30 @@ WS_PORT
 WS_PATH
 ```
 
-Then redeploy.
+When all values are valid, the deployment exposes **4 nodes**. Partial configuration does not create a fourth node.
 
-The generator recognizes the complete set and adds the Cloudflare WS node. The resulting topology is exactly **4 nodes**.
+## Runtime behavior
 
-Expected runtime markers:
+Each deployment reads the current Railway networking values and regenerates runtime output from them. Previous `/data` state is used for continuity and diagnostics, not as an override for current Railway networking.
 
-```text
-SUBSCRIPTION_INVARIANT=4
-SUBSCRIPTION_COUNT=4
-NODES=4
-CLOUDFLARE_WS=enabled
-RELEASE=stable-optional-cloudflare-ws-v4
-```
+The supervisor monitors the gateway, Xray, and optional Cloudflare tunnel processes. Docker and Railway health checks use `/ready`.
 
-Partial or invalid Cloudflare configuration does not create a fourth node. It is reported through `CLOUDFLARE_VALIDATION` and the base topology remains the supported 3-node configuration when the optional variables are incomplete.
-
-## Railway networking change detection
-
-Every deployment reads the **current** Railway-injected values again:
+## Repository layout
 
 ```text
-RAILWAY_PUBLIC_DOMAIN
-RAILWAY_TCP_PROXY_DOMAIN
-RAILWAY_TCP_PROXY_PORT
+.
+├── config/          Xray configuration templates
+├── scripts/         Runtime, gateway, generation, and validation logic
+├── site/            Public dashboard
+├── Dockerfile
+├── railway.toml
+└── README.md
 ```
 
-The previous `/data/runtime.json` is used only for comparison. It is never used as the source of node addresses.
+## Security
 
-The runtime reports one of:
+Never commit tunnel tokens, private keys, generated credentials, subscription URLs, or deployment-specific domains. Keep secrets in Railway environment variables and generated state in the persistent Volume.
 
-```text
-RAILWAY_NETWORKING=initial
-RAILWAY_NETWORKING=unchanged
-RAILWAY_NETWORKING=changed
-```
+## License
 
-If Railway replaces or changes the Public Domain or TCP Proxy, the deployment reports `changed` and regenerates the subscription using the **new current Railway values**. If they are unchanged, it reports `unchanged` and regenerates using the same current values.
-
-For a changed networking deployment, the log also records:
-
-```text
-RAILWAY_NETWORKING_PREVIOUS_PUBLIC=...
-RAILWAY_NETWORKING_CURRENT_PUBLIC=...
-RAILWAY_NETWORKING_PREVIOUS_TCP=...
-RAILWAY_NETWORKING_CURRENT_TCP=...
-```
-
-The comparison is diagnostic only. It does not freeze or override Railway networking.
-
-## Persistent state
-
-Create a Railway Volume mounted at:
-
-```text
-/data
-```
-
-The service persists generated identity and runtime state there, including its UUID, REALITY keys, subscription token, short IDs, runtime manifest, and subscription output. A fresh deployment without the Volume can generate a new identity and invalidate existing client configurations.
-
-Keep the service at one replica when using the Volume.
-
-## Health and restart behavior
-
-The application health endpoint is:
-
-```text
-GET /ready
-```
-
-Both the Docker healthcheck and `railway.toml` use this endpoint. The supervisor also watches the Xray, gateway, and optional Cloudflare tunnel processes.
-
-## Build identity
-
-The build identity is intentionally fixed to:
-
-```text
-SOURCE_BUILD=main-hardened-v4
-BUILD_ID=stable-optional-cloudflare-ws-v4
-```
-
-Runtime state, manifest output, and startup logs must use the same `v4` identity.
-
-## Public dashboard
-
-`site/index.html` is a public travel-themed dashboard. It must not expose deployment domains, Railway identifiers, proxy details, node topology, or internal runtime information.
+Add the repository license appropriate to your use case.

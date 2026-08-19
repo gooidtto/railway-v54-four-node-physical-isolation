@@ -15,8 +15,9 @@ COPY scripts/ /opt/xray/scripts/
 COPY config/ /opt/xray/config/
 COPY site/ /opt/xray/site/
 RUN chmod 0755 /usr/local/bin/xray /usr/local/bin/cloudflared /opt/xray/scripts/*.sh /opt/xray/scripts/*.py && chmod 0644 /opt/xray/config/* /opt/xray/site/*
-ENV BUILD_ID=stable-optional-cloudflare-ws-v4 \
-    SOURCE_BUILD=main-hardened-v4 \
+ENV BUILD_ID=railway-production-v5 \
+    SOURCE_BUILD=6afe981f6063e8c7f0db4b7791dcd9b81808fa37 \
+    NODE_MODE=4 \
     PORT=8080 \
     GATEWAY_PORT=8080 \
     XRAY_CONFIG=/etc/xray/config.json \
@@ -39,4 +40,4 @@ RUN echo "SOURCE_BUILD=${SOURCE_BUILD} BUILD_ID=${BUILD_ID}"
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=5 CMD python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/ready', timeout=8).read()"
 WORKDIR /opt/xray
-ENTRYPOINT ["/opt/xray/scripts/start.sh"]
+ENTRYPOINT ["/opt/xray/scripts/production-guard.sh"]

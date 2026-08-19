@@ -1,19 +1,41 @@
 {
-  "release": "railway-production-v5",
-  "baseline_commit": "6afe981f6063e8c7f0db4b7791dcd9b81808fa37",
-  "node_mode": "4-required",
-  "architecture": "single-8080-router-plus-required-cloudflare-tunnel",
-  "nodes": [
-    "domain-xhttp-tls",
-    "raw-reality-vision",
-    "xhttp-reality",
-    "cloudflare-ws-tls"
-  ],
+  "schema": 2,
+  "kind": "runtime-capability-policy",
+  "description": "Static policy only. Runtime node names, endpoints, count and capabilities are discovered from the current Railway deployment environment and generated at startup.",
+  "runtime_discovery": {
+    "public_domain": "RAILWAY_PUBLIC_DOMAIN",
+    "tcp_proxy_domain": "RAILWAY_TCP_PROXY_DOMAIN",
+    "tcp_proxy_port": "RAILWAY_TCP_PROXY_PORT",
+    "cloudflare": [
+      "CLOUDFLARE_TUNNEL_TOKEN",
+      "CLOUDFLARE_TUNNEL_ID",
+      "CLOUDFLARE_PUBLIC_HOSTNAME",
+      "CLOUDFLARE_ORIGIN_SERVICE",
+      "WS_PORT",
+      "WS_PATH"
+    ]
+  },
+  "node_policy": {
+    "base": "generate from available Railway networking",
+    "cloudflare": "generate when complete Cloudflare configuration is present",
+    "count": "runtime-derived",
+    "names": "runtime-derived",
+    "endpoints": "runtime-derived"
+  },
+  "core_capabilities": {
+    "single_gateway": true,
+    "sni_routing": true,
+    "fragmented_clienthello": true,
+    "dynamic_railway_networking": true,
+    "subscription_generation": true,
+    "uuid_invariant": true,
+    "cloudflare_tunnel": true
+  },
   "invariants": [
     "uuid-match",
     "subscription-count-match",
-    "railway-networking-current-environment",
+    "current-networking-authoritative",
     "fragmented-clienthello-routing",
-    "cloudflare-ready"
+    "cloudflare-ready-when-configured"
   ]
 }
